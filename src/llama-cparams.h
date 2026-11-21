@@ -75,4 +75,9 @@ struct llama_cparams {
 
     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
     llama_context * ctx_state_src;
+
+    // local (Inkling 2 DSpark drafter, llama_context::dspark_head_precompute): the target's output matrix times
+    // dspark_hidden_out (Q8_0 [rank, n_vocab]) and times dspark_hidden_out_b (F32 [n_vocab]), computed once at init
+    ggml_tensor * dspark_head_c  = nullptr;
+    ggml_tensor * dspark_head_cb = nullptr;
 };

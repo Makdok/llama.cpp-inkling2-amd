@@ -22,6 +22,28 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <mutex>
+
+// local diagnostic, the host side of GGML_CUDA_INK2_TIMELINE=1 (the CUDA/HIP backend writes the device side): one line per
+// host stage of a ubatch, same format and clock, buffered and written in chunks of 4096 lines
+static void llama_ink2_tl(const void * who, const char * ev, long long a = 0, long long b = 0) {
+    static const bool on = []() { const char * e = getenv("GGML_CUDA_INK2_TIMELINE"); return e && atoi(e) != 0; }();
+    if (!on) {
+        return;
+    }
+    static std::mutex  mtx;
+    static std::string buf;
+    static int         n = 0;
+    char line[128];
+    snprintf(line, sizeof(line), "ink2 tl %lld %p %s %lld %lld\n", (long long) ggml_time_us(), who, ev, a, b);
+    std::lock_guard<std::mutex> lock(mtx);
+    buf += line;
+    if (++n % 4096 == 0) {
+        fwrite(buf.data(), 1, buf.size(), stderr);
+        fflush(stderr);
+        buf.clear();
+    }
+}
 
 //
 // llama_context
@@ -165,6 +187,20 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.name             =*/ "fused top-k mask",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// outputs of the worst-case graph reserved for a ubatch of n_tokens
+// local: a DFlash/DSpark drafter counts as an encoder model, which forces n_outputs_max to n_batch, but its decode ubatches
+// read at most n_outputs_max_per_seq outputs per sequence (a draft block; injections read none). Reserving n_ubatch outputs
+// built the output matrix product for every row of a 512-token ubatch: 0.8 GB of compute buffer for at most 8 outputs. A
+// ubatch with more outputs still works (the buffer grows when it is allocated). INKLING2_DRAFT_RESERVE_ALL=1 restores it.
+static uint32_t llama_reserve_n_outputs(const llama_model & model, const llama_cparams & cparams, uint32_t n_tokens) {
+    uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
+    static const bool reserve_all = std::getenv("INKLING2_DRAFT_RESERVE_ALL") != nullptr;
+    if (model.arch == LLM_ARCH_DFLASH && !reserve_all && cparams.n_outputs_max_per_seq > 0) {
+        n_outputs = std::min(n_outputs, std::max<uint32_t>(1, cparams.n_outputs_max_per_seq*cparams.n_seq_max));
+    }
+    return n_outputs;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -655,6 +691,8 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        dspark_head_precompute();
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -890,7 +928,7 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = llama_reserve_n_outputs(model, cparams, n_tokens);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -1000,7 +1038,25 @@ void llama_context::synchronize() {
         return;
     }
 
+    llama_ink2_tl(this, "lsync", n_queued_tokens);
     ggml_backend_sched_synchronize(sched.get());
+    llama_ink2_tl(this, "lsync_end", n_queued_tokens);
+
+    // local: INKLING2_STEP_LOG=1, see the decode side (t_compute_start_us is set by the first decode since the last sync)
+    {
+        static const bool step_log = getenv("INKLING2_STEP_LOG") != nullptr;
+        static int64_t t_last_sync_end = 0;
+        static int     n_lines = 0;
+        if (step_log && n_queued_tokens > 0 && n_queued_tokens <= 8 && n_lines < 6000) {
+            const int64_t now = ggml_time_us();
+            n_lines++;
+            fprintf(stderr, "step %p n %d since_prev_sync_end %lld us, decode_to_sync %lld us\n", (void *) this, (int) n_queued_tokens,
+                (long long) (t_last_sync_end ? t_compute_start_us - t_last_sync_end : 0), (long long) (now - t_compute_start_us));
+        }
+        if (step_log && n_queued_tokens > 0) {
+            t_last_sync_end = ggml_time_us();
+        }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1120,7 +1176,7 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+        const uint32_t n_outputs_max = llama_reserve_n_outputs(model, cparams, n_tokens);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
@@ -1533,6 +1589,139 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
     return nullptr;
 }
 
+// local: Inkling 2 DSpark drafter. Each drafted position multiplied the target's output matrix W (0.38-0.47 GB) by
+// h + Hout*latent + b. With C = W*Hout (Q8_0 [rank, n_vocab], 55 MB for Inkling 2 Mini) and cb = W*b computed here once, the
+// drafting graph (dspark.cpp) multiplies W once by the hidden states of all the drafted positions (one read of W with several
+// columns) and each position only reads C. INKLING2_DSPARK_HEADC=0 disables it (product with W per position, as before).
+void llama_context::dspark_head_precompute() {
+    {
+        const char * e = getenv("INKLING2_DSPARK_HEADC");
+        if (e && e[0] == '0') {
+            return;
+        }
+    }
+    const auto & hp = model.hparams;
+    if (model.arch != LLM_ARCH_DFLASH || !hp.dspark_markov_rank || !model.dspark_hidden_out || !model.dspark_hidden_out_b ||
+        !cparams.ctx_other || model.no_alloc()) {
+        return;
+    }
+    const char * func = __func__;
+    const auto skip = [&](const char * why) {
+        LLAMA_LOG_INFO("%s: not used (%s)\n", func, why);
+    };
+    const llama_model * target = llama_get_model(cparams.ctx_other);
+    ggml_tensor * W = target ? target->output : nullptr;
+    ggml_tensor * H = model.dspark_hidden_out;   // [rank, n_embd]
+    ggml_tensor * B = model.dspark_hidden_out_b; // [n_embd]
+    if (!W || target->no_alloc()) {
+        return skip("no target output matrix");
+    }
+    if (target->output_s) {
+        return skip("scaled output matrix");
+    }
+    const int64_t rank   = H->ne[0];
+    const int64_t n_embd = H->ne[1];
+    const int64_t n_rows = W->ne[1];
+    if (W->ne[0] != n_embd || ggml_nelements(B) != n_embd || W->ne[2] != 1 || W->ne[3] != 1 || H->ne[2] != 1 || H->ne[3] != 1 ||
+        rank % ggml_blck_size(GGML_TYPE_Q8_0) != 0) {
+        return skip("shapes");
+    }
+    ggml_backend_dev_t dev = nullptr;
+    for (const ggml_tensor * t : { W, H, B }) {
+        if (!t->buffer || !t->data || ggml_backend_buffer_is_host(t->buffer)) {
+            return skip("weights not on a device");
+        }
+        ggml_backend_dev_t d = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        if (dev && d != dev) {
+            return skip("weights on different devices");
+        }
+        dev = d;
+    }
+    ggml_backend_t backend = dev ? backend_from_dev(dev) : nullptr;
+    if (!backend) {
+        return skip("no backend for the device of the weights");
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    {
+        ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+        ctx_dspark_head.reset(ggml_init(ip));
+    }
+    ggml_tensor * C  = ggml_new_tensor_2d(ctx_dspark_head.get(), GGML_TYPE_Q8_0, rank, n_rows);
+    ggml_tensor * CB = ggml_new_tensor_1d(ctx_dspark_head.get(), GGML_TYPE_F32, n_rows);
+    ggml_set_name(C,  "dspark_head_c");
+    ggml_set_name(CB, "dspark_head_cb");
+    buf_dspark_head.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dspark_head.get(), buft));
+    if (!buf_dspark_head) {
+        ctx_dspark_head.reset();
+        return skip("failed to allocate the buffer");
+    }
+
+    // one graph, W in chunks of rows: P = W_chunk x Hout^T (F32 [rows, rank]), then C_chunk = P^T in Q8_0, and
+    // cb_chunk = W_chunk x b; the allocator reuses the temporaries of a chunk for the next one. Hout^T is multiplied in
+    // groups of at most 128 columns: wider products of K-quants go to hipBLAS on RDNA3.0 (dequantized F16 copy of W in the
+    // CUDA pool and new BLAS kernels loaded, +0.2 GB of VRAM kept for the life of the context), these stay on MMQ.
+    const int64_t chunk    = 16384;
+    const int64_t n_chunks = (n_rows + chunk - 1)/chunk;
+    const int64_t cgroup   = 128;
+    const int64_t n_groups = (rank + cgroup - 1)/cgroup;
+    const size_t  n_nodes  = 64 + (16 + 4*n_groups)*n_chunks;
+    ggml_context_ptr gctx;
+    {
+        ggml_init_params ip = { ggml_tensor_overhead()*n_nodes + ggml_graph_overhead_custom(n_nodes, false), nullptr, true };
+        gctx.reset(ggml_init(ip));
+    }
+    ggml_context * g = gctx.get();
+    ggml_cgraph * gf = ggml_new_graph_custom(g, n_nodes, false);
+    ggml_tensor * hf = H->type == GGML_TYPE_F32 ? H : ggml_cast(g, H, GGML_TYPE_F32);
+    ggml_tensor * bf = B->type == GGML_TYPE_F32 ? B : ggml_cast(g, B, GGML_TYPE_F32);
+    ggml_tensor * x  = ggml_cont(g, ggml_transpose(g, hf));                       // [n_embd, rank]
+    ggml_tensor * xb = ggml_reshape_2d(g, bf, n_embd, 1);                          // [n_embd, 1]
+    for (int64_t v0 = 0; v0 < n_rows; v0 += chunk) {
+        const int64_t nr = std::min(chunk, n_rows - v0);
+        ggml_tensor * w  = ggml_view_2d(g, W, n_embd, nr, W->nb[1], v0*W->nb[1]);
+        ggml_tensor * p  = nullptr;                                                // [nr, rank]
+        for (int64_t c0 = 0; c0 < rank; c0 += cgroup) {
+            const int64_t nc = std::min(cgroup, rank - c0);
+            ggml_tensor * pc = ggml_mul_mat(g, w, ggml_view_2d(g, x, n_embd, nc, x->nb[1], c0*x->nb[1]));
+            p = p ? ggml_concat(g, p, pc, 1) : pc;
+        }
+        ggml_tensor * ct = ggml_cont(g, ggml_transpose(g, p));                     // [rank, nr]
+        ggml_build_forward_expand(gf, ggml_cpy(g, ct, ggml_view_2d(g, C, rank, nr, C->nb[1], v0*C->nb[1])));
+        ggml_build_forward_expand(gf, ggml_cpy(g, ggml_mul_mat(g, w, xb), ggml_view_2d(g, CB, nr, 1, nr*CB->nb[0], v0*CB->nb[0])));
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const bool empty = node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                           node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_PERMUTE;
+        if (!empty && !ggml_backend_supports_op(backend, node)) {
+            buf_dspark_head.reset();
+            ctx_dspark_head.reset();
+            return skip(ggml_op_desc(node));
+        }
+    }
+    ggml_gallocr_t galloc = ggml_gallocr_new(buft);
+    bool ok = galloc && ggml_gallocr_alloc_graph(galloc, gf);
+    ok = ok && ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    ggml_backend_synchronize(backend);
+    const size_t tmp_size = ok ? ggml_gallocr_get_buffer_size(galloc, 0) : 0;
+    if (galloc) {
+        ggml_gallocr_free(galloc);
+    }
+    if (!ok) {
+        buf_dspark_head.reset();
+        ctx_dspark_head.reset();
+        return skip("compute failed");
+    }
+    cparams.dspark_head_c  = C;
+    cparams.dspark_head_cb = CB;
+    LLAMA_LOG_INFO("%s: %10s target output x dspark_hidden_out [%lld, %lld] Q8_0 + bias, %.2f MiB, in %.1f ms (temporaries %.1f MiB)\n",
+            __func__, ggml_backend_buffer_name(buf_dspark_head.get()), (long long) rank, (long long) n_rows,
+            ggml_backend_buffer_get_size(buf_dspark_head.get())/1024.0/1024.0, (ggml_time_us() - t_start_us)/1000.0,
+            tmp_size/1024.0/1024.0);
+}
+
 void llama_context::layer_inp_dev_alloc() {
     synchronize();
 
@@ -1858,6 +2047,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // local: INKLING2_HOST_TIME=1 times the host stages of a ubatch
+    static const bool host_time = getenv("INKLING2_HOST_TIME") != nullptr;
+    int64_t ht[6] = { 0, 0, 0, 0, 0, 0 };
+    bool    ht_reused = false;
+    ht[0] = host_time ? ggml_time_us() : 0;
+    llama_ink2_tl(this, "ub", ubatch.n_tokens, (long long) gtype);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1871,7 +2066,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    ht[1] = host_time ? ggml_time_us() : 0;
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+        ht_reused = true;
+        ht[2] = ht[3] = host_time ? ggml_time_us() : 0;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1892,6 +2090,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        ht[2] = host_time ? ggml_time_us() : 0;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1908,6 +2107,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        ht[3] = host_time ? ggml_time_us() : 0;
     }
 
     // set the input data for the input tensors
@@ -1915,12 +2115,93 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        llama_ink2_tl(this, "ub_graph", ht_reused ? 1 : 0, (long long) ggml_graph_n_nodes(res->get_gf()));
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    llama_ink2_tl(this, "ub_inputs", ubatch.n_tokens);
 
+    ht[4] = host_time ? ggml_time_us() : 0;
+    // local: device-side wait for the producer of our injected rows (see INKLING2_INJECT_DEVWAIT in decode)
+    if (pending_wait_ev) {
+        ggml_backend_event_wait(pending_wait_backend, pending_wait_ev);
+        pending_wait_ev      = nullptr;
+        pending_wait_backend = nullptr;
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (host_time) {
+        ht[5] = ggml_time_us();
+        static double acc[5] = { 0, 0, 0, 0, 0 };
+        static int64_t n_acc = 0;
+        static int64_t n_built = 0;
+        static int     n_print = 0;
+        if (ubatch.n_tokens <= 8) {
+            if (n_acc == 0) {
+                atexit([]() {
+                    fprintf(stderr, "host time, ubatches of 1 to 8 tokens: %lld ubatches (%lld graphs built): apply %.0f, build/reuse check %.0f, alloc %.0f, "
+                        "set_inputs %.0f, compute call %.0f us\n", (long long) n_acc, (long long) n_built,
+                        acc[0]/n_acc, acc[1]/n_acc, acc[2]/n_acc, acc[3]/n_acc, acc[4]/n_acc);
+                });
+            }
+            for (int i = 0; i < 5; ++i) {
+                acc[i] += (double) (ht[i + 1] - ht[i]);
+            }
+            n_acc++;
+            n_built += ht_reused ? 0 : 1;
+        } else if (ubatch.n_tokens > 8 && (ubatch.embd || ubatch.embd_row)) {
+            // the injection ubatches of a drafter (target features as input rows): averages every 16
+            static double  inj[5] = { 0, 0, 0, 0, 0 };
+            static int64_t n_inj  = 0;
+            for (int i = 0; i < 5; ++i) {
+                inj[i] += (double) (ht[i + 1] - ht[i]);
+            }
+            if (++n_inj % 16 == 0) {
+                fprintf(stderr, "host time, 16 injection ubatches of %u: apply %.0f, build/reuse check %.0f, alloc %.0f, set_inputs %.0f, compute call %.0f us\n",
+                    ubatch.n_tokens, inj[0]/16, inj[1]/16, inj[2]/16, inj[3]/16, inj[4]/16);
+                for (int i = 0; i < 5; ++i) {
+                    inj[i] = 0.0;
+                }
+            }
+        } else if (ubatch.n_tokens > 8) {
+            // large ubatches (prompt reading): running averages every 16, with the wall time between two of them
+            static double  big[5]  = { 0, 0, 0, 0, 0 };
+            static int64_t n_big   = 0;
+            static int64_t t_first = 0;
+            static int64_t t_prev  = 0;
+            static double  gap     = 0.0;
+            if (n_big % 16 == 0) {
+                for (int i = 0; i < 5; ++i) {
+                    big[i] = 0.0;
+                }
+                gap     = 0.0;
+                t_first = ht[0];
+            } else {
+                gap += (double) (ht[0] - t_prev);
+            }
+            t_prev = ht[5];
+            for (int i = 0; i < 5; ++i) {
+                big[i] += (double) (ht[i + 1] - ht[i]);
+            }
+            n_big++;
+            if (n_big % 16 == 0) {
+                fprintf(stderr, "host time, 16 ubatches of %u: apply %.0f, build/reuse check %.0f, alloc %.0f, set_inputs %.0f, compute call %.0f, "
+                    "between ubatches %.0f us each; wall %.0f ms\n", ubatch.n_tokens, big[0]/16, big[1]/16, big[2]/16, big[3]/16, big[4]/16,
+                    gap/15, (double) (ht[5] - t_first)/1000.0);
+                // everything included, from the end of the previous group of 16
+                static int64_t t_group_end = 0;
+                if (t_group_end) {
+                    fprintf(stderr, "host time, group of 16 ubatches end to end: %.0f ms\n", (double) (ht[5] - t_group_end)/1000.0);
+                }
+                t_group_end = ht[5];
+            }
+        } else if (ubatch.n_tokens <= 8 && n_print < 40) {
+            n_print++;
+            fprintf(stderr, "host time, ubatch of %u (%s): apply %lld, build/reuse check %lld, alloc %lld, set_inputs %lld, compute call %lld us\n",
+                ubatch.n_tokens, ht_reused ? "reused" : "built", (long long) (ht[1] - ht[0]), (long long) (ht[2] - ht[1]),
+                (long long) (ht[3] - ht[2]), (long long) (ht[4] - ht[3]), (long long) (ht[5] - ht[4]));
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2207,6 +2488,30 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
         return -1;
     }
 
+    // local: INKLING2_HOST_TIME=1 also splits the host time of the decodes of injected rows (drafter prompt injection):
+    // until the memory is ready, the ubatch loop, and the end (outputs), averages every 16 decodes
+    static const bool dec_time = getenv("INKLING2_HOST_TIME") != nullptr;
+    struct dec_timer {
+        bool    on;
+        int64_t t[4];
+        ~dec_timer() {
+            if (!on || t[2] == 0) {
+                return;
+            }
+            const int64_t t_end = ggml_time_us();
+            static double  acc[3] = { 0, 0, 0 };
+            static int64_t n      = 0;
+            acc[0] += (double) (t[1] - t[0]);
+            acc[1] += (double) (t[2] - t[1]);
+            acc[2] += (double) (t_end - t[2]);
+            if (++n % 16 == 0) {
+                fprintf(stderr, "host time, 16 injection decodes: start to memory ready %.0f, ubatch loop %.0f, end %.0f us each\n",
+                    acc[0]/16, acc[1]/16, acc[2]/16);
+                acc[0] = acc[1] = acc[2] = 0.0;
+            }
+        }
+    } dtimer { dec_time && has_embd_row && batch_inp.tokens.size() > 8, { ggml_time_us(), 0, 0, 0 } };
+
     const bool has_state_row = !batch_inp.tokens.empty() && batch_inp.tokens[0].state_row >= 0;
     if (has_state_row && !supports_state_row()) {
         LLAMA_LOG_ERROR("%s: this context cannot read state rows (needs an MTP context and an h_nextn device buffer in ctx_state_src)\n", __func__);
@@ -2356,12 +2661,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    dtimer.t[1] = ggml_time_us();
+
     // ordering for the layer input device buffer
     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
     ggml_backend_t  inject_backend = nullptr;
     if (inject_src) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
-        if (inject_backend) {
+        // local (HIP): INKLING2_INJECT_DEVWAIT (default on) makes the device wait for the target batch right before the
+        // compute of our first ubatch (process_ubatch), so that the host builds and allocates the injection graph while the
+        // target batch still runs, and goes on to the next target batch without draining the GPU (prompt reading with the
+        // DSpark drafter lost 5 % to that host wait). =0 restores the host wait.
+        // Only on the ROCm (HIP) backend, where it was measured: every other backend keeps the stock host wait (a device-side
+        // wait trips the Metal command buffer timeout on long prompts).
+        static const bool devwait = []() { const char * e = getenv("INKLING2_INJECT_DEVWAIT"); return !(e && e[0] == '0'); }();
+        const bool devwait_ok = devwait && inject_backend && strncmp(ggml_backend_name(inject_backend), "ROCm", 4) == 0;
+        if (inject_backend && devwait_ok) {
+            pending_wait_ev      = inject_src->ev_layer_inp_written.get();
+            pending_wait_backend = inject_backend;
+        } else if (inject_backend) {
             // wait on the host: a device-side wait would stall our queue for the whole target batch,
             // which trips the Metal command buffer timeout on long prompts
             ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
@@ -2576,6 +2894,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    dtimer.t[2] = ggml_time_us();
 
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);

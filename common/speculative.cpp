@@ -1,5 +1,7 @@
 #include "speculative.h"
 
+#include <cstdlib>
+
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -1195,6 +1197,34 @@ public:
 
         const int32_t n_tokens = batch_in.size();
 
+        // local TIMING EXPERIMENT ONLY (drafts degrade): INKLING2_SKIP_INJECT=1 skips the injection of prompt batches; only in
+        // builds with GGML_CUDA_INK2_COST_TOOLS defined
+#if defined(GGML_CUDA_INK2_COST_TOOLS)
+        static const bool skip_inject = getenv("INKLING2_SKIP_INJECT") != nullptr;
+#else
+        static const bool skip_inject = false;
+#endif
+        if (skip_inject && n_tokens > 16) {
+            return true;
+        }
+        // local: INKLING2_INJECT_TIME=1 times the injection of prompt batches alone (the target batch is waited for first,
+        // the drafter is synchronized at the end; this serializes, timing only), printed every 8 batches
+        static const bool inject_time = getenv("INKLING2_INJECT_TIME") != nullptr;
+        struct inject_timer {
+            bool on; llama_context * dft; int64_t t0;
+            ~inject_timer() {
+                if (!on) { return; }
+                llama_synchronize(dft);
+                static double acc = 0.0; static int n = 0;
+                acc += (double) (ggml_time_us() - t0);
+                if (++n % 8 == 0) { fprintf(stderr, "inject time: %.1f ms per prompt batch (last 8)\n", acc/8/1000.0); acc = 0.0; }
+            }
+        };
+        if (inject_time && n_tokens > 16) {
+            llama_synchronize(this->params.ctx_tgt);
+        }
+        inject_timer itimer { inject_time && n_tokens > 16, this->params.ctx_dft, ggml_time_us() };
+
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
@@ -1245,6 +1275,11 @@ public:
                         LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
+                    }
+                    // local: the recurrent heads keep the context features of the last block_size + 1 positions (no-op for the
+                    // others): only the chunk(s) holding them are read back, the other chunks of a prompt batch stay async
+                    if (offset + n_chunk > n_rows - (block_size + 1)) {
+                        store_context_features(seq_id, n_chunk);
                     }
                     continue;
                 }
@@ -1436,10 +1471,29 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
         // anchor-first DSpark yields a full block_size draft tokens
         // the recurrent head reads the context features back from h_nextn after a host copy injection
+        // local: INKLING2_DSPARK_DEV (default on) injects the Inkling2 target features from the target's device buffer too
+        // (the context features are read back after the device injection as well, see process()): the host copies moved
+        // ~75 MB down and up per 2048-token prompt batch and cost ~5 % of the prompt reading
+        // Only where it was validated: when the first GPU device is a CUDA or ROCm one (the release keeps the host copies for
+        // the other backends).
+        static const bool rnn_dev = []() {
+            const char * e = getenv("INKLING2_DSPARK_DEV");
+            if (e && e[0] == '0') {
+                return false;
+            }
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    const char * n = ggml_backend_dev_name(d);
+                    return strncmp(n, "CUDA", 4) == 0 || strncmp(n, "ROCm", 4) == 0;
+                }
+            }
+            return false;
+        }();
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
             /* .backend_sampling = */ !has_rnn_context,
-            /* .dev_features     = */ !has_rnn_context,
+            /* .dev_features     = */ !has_rnn_context || rnn_dev,
             /* .nextn_masked     = */ !has_rnn_context,
         });
 
@@ -1505,8 +1559,11 @@ public:
             const int32_t n_block_tokens = has_rnn_context ? block_size : n_draft + (sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
+            // local: with the in-graph recurrent head only the positions 1..n_draft are read back, mark those
+            // as outputs so that the graph skips the head of the others (one pass over the target output matrix each)
+            const bool all_outputs = !has_rnn_context || params.probabilistic || std::getenv("INKLING2_DSPARK_ALL") != nullptr;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, all_outputs || (i >= 1 && i <= n_draft));
                 if (has_rnn_context) {
                     // the context features of the committed anchor condition the recurrent head
                     const llama_pos pos = dp.pos0 - 1;
@@ -1611,6 +1668,9 @@ public:
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+            // local: the Inkling2 drafting graph selects the tokens on the device and writes token + 1 into element
+            // markov_rank of the chain state rows (0 = not written, then the logits are there and sampled on the host)
+            const float * dev_rows = has_rnn_context ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
             for (int32_t i = i_draft_beg; i < std::min(n_block_tokens, i_draft_beg + params.n_max); ++i) {
@@ -1620,7 +1680,8 @@ public:
                     break;
                 }
 
-                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
+                const float code = dev_rows && markov_rank < n_embd_dec ? dev_rows[(size_t) idx * n_embd_dec + markov_rank] : 0.0f;
+                const llama_token sampled = code >= 1.0f ? (llama_token) code - 1 : common_sampler_sample(smpl, ctx_dft, idx, true);
                 if (has_rnn_context) {
                     // Use the first maximum, as in the RNN conditioning graph.
                     common_sampler_accept(smpl, sampled, true);
@@ -1641,6 +1702,18 @@ public:
                 common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
+            }
+
+            // local: INKLING2_DRAFT_LOG=1 prints the drafted tokens of every step (A/B of the drafter graph)
+            {
+                static const bool draft_log = std::getenv("INKLING2_DRAFT_LOG") != nullptr;
+                if (draft_log) {
+                    std::string s;
+                    for (const llama_token t : result) {
+                        s += " " + std::to_string(t);
+                    }
+                    fprintf(stderr, "dspark draft pos %d last %d:%s\n", (int) dp.pos0, (int) dp.id_last, s.c_str());
+                }
             }
 
             if (result.size() < (size_t) params.n_min) {
