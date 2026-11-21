@@ -1,0 +1,3 @@
+# Build folders (scripts/inkling2-amd/build-hip.cmd and the Linux commands of the README). The source archive this
+# branch is built from carries no .gitignore.
+/build*/
