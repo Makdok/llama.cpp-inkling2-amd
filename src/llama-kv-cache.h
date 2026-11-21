@@ -197,6 +197,10 @@ public:
     // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
+    // local: the same for a full ring that has wrapped (an SWA cache): every cell used, cell (rot + i) mod size holds position
+    // pos_min + i, and the ubatch is the tail; returns the cell count (0 otherwise) and the rotation
+    uint32_t get_n_kv_pos_rotated(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & rot) const;
+
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
@@ -253,6 +257,10 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+
+    // local (Inkling): F16 [n_kv] sign*clamp(p0 - p_min, lo, hi) per cell, p_min the first position of a single-sequence
+    // ubatch, hi for the empty cells and the cells of other sequences; the KQ mask is then built on the device
+    void set_input_kq_rel_pos(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t lo, int32_t hi, float sign) const;
 
     // idx(i, j) = i*(extent + 1) + rel; out-of-band cells map to the zero column `extent`
     void set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
@@ -425,6 +433,8 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_pos_contiguous() const;
+    // local: contiguous cells (rot = 0), or else (allow_rot) a wrapped ring with its rotation; 0 = neither
+    uint32_t get_n_kv_banded(uint32_t & rot, bool allow_rot) const;
     uint32_t get_n_kv_rows() const;
     uint32_t get_size() const;
 
@@ -463,6 +473,7 @@ public:
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_kq_rel_pos(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t lo, int32_t hi, float sign) const; // inkling
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

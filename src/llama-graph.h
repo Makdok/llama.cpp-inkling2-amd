@@ -334,6 +334,9 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // local: rollback slot order {K-1, ..., 0} of build_conv_state_store, built once per graph and shared by the layers
+    ggml_tensor * s_slot_rev = nullptr;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -822,8 +825,24 @@ public:
     ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
     ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
 
+    // local: [base, swa] KQ masks of the far attention built on the device from F16 positions relative to the first position
+    // of a single-sequence ubatch (exact integers below 2048), instead of the n_kv x n_tokens masks filled on the host
+    // (5-8 ms each for a 1024-token ubatch) and uploaded synchronously at every ubatch. INKLING2_MASK_DEV=0 disables it.
+    // keep iff q + 1 - k >= 1 (causal) and, for the SWA cache, k - (q - n_swa) >= 1 (window): clamp to {0, 1}, log
+    bool          kq_dev[2]       = { false, false };
+    bool          kq_dev_model[2] = { false, false };     // the model and context allow it, the ubatch decides
+    ggml_tensor * kq_k_neg[2]    = { nullptr, nullptr }; // F16 [n_kv]: -clamp(p0 - p_min, lo, hi), hi for cells not visible
+    ggml_tensor * kq_k_pos       = nullptr;              // F16 [n_kv_swa]: +clamp(p0 - p_min, lo, hi)
+    ggml_tensor * kq_q_neg1      = nullptr;              // F16 [1, n_tokens]: -(p - p_min + 1)
+    ggml_tensor * kq_q_swa       = nullptr;              // F16 [1, n_tokens]: p - p_min - n_swa
+    ggml_tensor * kq_mask_gen[2] = { nullptr, nullptr };
+    uint32_t      kq_n_swa       = 0;
+
     // [base, swa] K/V cells of the banded attention, 0 = dense
     uint32_t n_kv_banded[2] = { 0, 0 };
+    // local: [base, swa] rotation of a wrapped ring (the SWA cache), see ggml_flash_attn_ext_banded_set_far_rot; 0 = contiguous
+    uint32_t kv_rot[2]      = { 0, 0 };
+    bool     allow_rot      = false;
     bool     banded         = false;
 
     const uint32_t extent;

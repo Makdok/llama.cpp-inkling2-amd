@@ -2,13 +2,44 @@
 #include "../llama-memory-hybrid-iswa.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 // max elements of the dense relative bias per attention call, and max chunks per layer
-static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
+// local: on a device that runs the far op, the dense path is only the fallback of large ubatches when a cache is not
+// position-contiguous: there the budget is 2^25 (with 2^29 a 1024-token ubatch made [2048, 1024, 24] F32 bias tensors,
+// 192 MiB each, that grew the compute buffer by 117 MiB after load, and a fallback on the global cache would make 1.5 GiB
+// ones; with 2^25 the bias is chunked, 96 / 384 MiB). Elsewhere the dense path is the main one and keeps the stock 2^29.
+// INKLING2_KQ_BIAS_LOG2 sets both.
+static const int64_t n_kq_bias_max_far = []() {
+    const char * e = std::getenv("INKLING2_KQ_BIAS_LOG2");
+    const int    n = e ? atoi(e) : 25;
+    return int64_t(1) << (n >= 16 && n <= 32 ? n : 25);
+}();
+static const int64_t n_kq_bias_max = []() {
+    const char * e = std::getenv("INKLING2_KQ_BIAS_LOG2");
+    const int    n = e ? atoi(e) : 29;
+    return int64_t(1) << (n >= 16 && n <= 32 ? n : 29);
+}();
 static constexpr int64_t n_kq_chunk_max = 64;
 // ubatches up to this many tokens keep the dense path
 static constexpr int64_t n_tokens_banded_min = 32;
+// local (RDNA3): the far banded op also serves small ubatches (the verify batches of speculative decoding), from
+// INKLING2_FAR_MIN tokens (default 2; a single token keeps the dense path and the vector kernel). INKLING2_FAR=0 disables far.
+static const bool inkling2_far_enabled = []() {
+    const char * e = std::getenv("INKLING2_FAR");
+    return !(e && e[0] == '0');
+}();
+static const int64_t n_tokens_far_min = []() {
+    const char * e = std::getenv("INKLING2_FAR_MIN");
+    const int    n = e ? atoi(e) : 64; // off by default: it prevents the graph reuse of the verify batches
+    return int64_t(n >= 1 ? n : 64);
+}();
+// local: INKLING2_BANDED=0 keeps the (chunked) dense path even where the banded op is supported
+static const bool inkling2_banded_enabled = []() {
+    const char * e = std::getenv("INKLING2_BANDED");
+    return !(e && e[0] == '0');
+}();
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -273,6 +304,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     if (dynamic) {
         const int64_t n_heads = dynamic->ne[0]/n_conv;
 
+        // local: the tap projection goes into the graph first, so that the convolution below is a contiguous run of nodes
+        // that the backend fuses into one kernel (ggml-cuda.cu, dconv)
+        ggml_build_forward_expand(gf, dynamic);
         dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
 
         for (int64_t lag = 0; lag < n_conv; ++lag) {
@@ -288,16 +322,29 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
-    return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    ggml_tensor * result = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    // local: the convolution goes into the graph right after its state store, so that the backend runs the input, the store
+    // and the convolution as one kernel (ggml-cuda.cu, sconv_full); the callers expand their residual add right after it
+    static const bool batch_opt_off = std::getenv("INKLING2_BATCH_OPT_OFF") != nullptr;
+    if (!batch_opt_off) {
+        ggml_build_forward_expand(gf, result);
+    }
+    return result;
 }
 
 llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     auto * inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     auto * attn = inp->get_attn();
     // banded FA needs a position-contiguous cache; small ubatches stay dense so the graph can be reused while decoding
-    inp->banded = cparams.flash_attn && n_tokens > n_tokens_banded_min;
+    inp->banded = inkling2_banded_enabled && cparams.flash_attn &&
+        (n_tokens > n_tokens_banded_min || (inkling2_far_enabled && n_tokens >= n_tokens_far_min));
+    // local: the SWA cache is a ring of n_swa + n_ubatch cells that wraps after the first ~1.5k tokens of a prompt; the far
+    // kernel reads it as a rotated ring (ggml_flash_attn_ext_banded_set_far_rot) instead of falling back to the dense bias
+    // (+45-60 ms per 512-token ubatch). INKLING2_SWA_ROT=0 restores the fallback.
+    static const bool swa_rot = []() { const char * e = std::getenv("INKLING2_SWA_ROT"); return !(e && e[0] == '0'); }();
+    inp->allow_rot = swa_rot && inkling2_far_enabled;
     for (int i = 0; i < 2 && inp->banded; ++i) {
-        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+        inp->n_kv_banded[i] = (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_banded(inp->kv_rot[i], i == 1 && inp->allow_rot);
     }
     std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok; // per (swa, device)
     const auto use_banded = [&](int il, bool swa) {
@@ -306,7 +353,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         const auto type_ok = [](ggml_type t) {
             return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
         };
-        if (!(inp->n_kv_banded[swa] > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
+        // the generic banded op needs contiguous cells (no rotation)
+        if (!(inp->n_kv_banded[swa] > 0 && inp->kv_rot[swa] == 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) && !cache->get_k_scale(il) && !cache->get_v_scale(il) &&
                 (swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3] == 1)) {
             return false;
@@ -334,6 +382,69 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         banded_dev_ok.push_back({ { swa, dev }, ok });
         return ok;
     };
+    // local (RDNA3): far banded op, see ggml_flash_attn_ext_banded_set_far. The probe uses realistic shapes because the
+    // WMMA kernel needs a padded K/V and a minimum number of query rows. INKLING2_FAR=0 disables it.
+    static const bool far_enabled = []() {
+        const char * e = std::getenv("INKLING2_FAR");
+        return !(e && e[0] == '0');
+    }();
+    std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> far_dev_ok; // per (swa, device)
+    // whether the device of layer il runs the far op at all (probe with realistic shapes, cached per cache kind and device)
+    const auto far_probe = [&](int il, bool swa) {
+        const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+        const int64_t hd = hparams.n_embd_head_k(il);
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (!far_enabled || !dev || (hd != 64 && hd != 128)) {
+            return false;
+        }
+        for (const auto & [key, ok] : far_dev_ok) {
+            if (key.first == swa && key.second == dev) {
+                return ok;
+            }
+        }
+        const int64_t nh  = hparams.n_head(il);
+        const int64_t nkv = hparams.n_head_kv(il);
+        const int64_t ne  = (swa ? hparams.n_swa : hparams.n_relative_extent) + 1;
+        ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, n_tokens, nh, 1);
+        ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 256, nkv, 1);
+        ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 256, nkv, 1);
+        ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 256, n_tokens, 1, 1);
+        ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, ne, nh, n_tokens, 1);
+        ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, ne);
+        ggml_flash_attn_ext_banded_set_far(op, 0);
+        const bool ok = ggml_backend_dev_supports_op(dev, op);
+        far_dev_ok.push_back({ { swa, dev }, ok });
+        return ok;
+    };
+    const auto use_far = [&](int il, bool swa) {
+        if (!far_enabled || !inp->banded) {
+            return false;
+        }
+        const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+        const int64_t hd = hparams.n_embd_head_k(il);
+        const auto type_ok = [](ggml_type t) {
+            return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+        };
+        const ggml_tensor * mask = swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+        if (!(inp->n_kv_banded[swa] > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
+                type_ok(cache->type_k()) && type_ok(cache->type_v()) && !cache->get_k_scale(il) && !cache->get_v_scale(il) &&
+                mask->ne[3] == 1 && mask->type == GGML_TYPE_F16 && GGML_PAD(inp->n_kv_banded[swa], 256) <= mask->ne[0])) {
+            return false;
+        }
+        // a rotated ring is viewed whole: its used cells padded to 256 make the ring (local: the empty cells of a ring that is
+        // not full, right after a checkpoint restore, are padding cells at the logical end); the kernel takes rotations below 2048
+        if (inp->kv_rot[swa] != 0 && (GGML_PAD(inp->n_kv_banded[swa], 256) != mask->ne[0] || inp->kv_rot[swa] >= 2048)) {
+            return false;
+        }
+        return far_probe(il, swa);
+    };
+    // local: on an AMD GPU (ROCm device) the generic banded kernel is slower than the dense path (measured on gfx1100); there
+    // the banded op is only taken where the far mode exists (RDNA3), other AMD GPUs keep the dense path
+    const auto banded_generic_ok = [&](int il, bool swa) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        const bool rocm = dev && strncmp(ggml_backend_dev_name(dev), "ROCm", 4) == 0;
+        return !rocm || far_probe(il, swa);
+    };
     auto * recr = inp->get_recr();
 
     ggml_tensor * inp_pos     = build_inp_pos();
@@ -352,6 +463,34 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     }
 
     std::vector<ggml_tensor *> blocks;
+
+    // local: a mix result [n_embd, n_q, n_tokens] laid out as [n_embd, n_tokens, n_q], so that each row j is a contiguous
+    // view. A single token or a single query is already in that layout (a reshape); otherwise one permuted copy, which the
+    // backend writes directly from the fused mix kernel, replaces one copy kernel per row (~200 per verify batch).
+    // INKLING2_BATCH_OPT_OFF=1 restores the copy per row (and one FILL of the zero sinks per attention call, see below).
+    static const bool mix_row_cont = std::getenv("INKLING2_BATCH_OPT_OFF") != nullptr;
+    const auto mix_rows = [&](ggml_tensor * mixed) {
+        if (mix_row_cont) {
+            return mixed;
+        }
+        if (n_tokens == 1 || mixed->ne[1] == 1) {
+            return ggml_reshape_3d(ctx0, mixed, n_embd, n_tokens, mixed->ne[1]);
+        }
+        return ggml_cont(ctx0, ggml_permute(ctx0, mixed, 0, 2, 1, 3));
+    };
+    const auto mix_row = [&](ggml_tensor * rows, int64_t j) {
+        if (mix_row_cont) {
+            ggml_tensor * v = ggml_view_2d(ctx0, rows, n_embd, n_tokens, rows->nb[2], j*rows->nb[1]);
+            return n_tokens == 1 ? v : ggml_cont(ctx0, v);
+        }
+        return ggml_view_2d(ctx0, rows, n_embd, n_tokens, rows->nb[1], j*rows->nb[2]);
+    };
+    // local: one zero sink tensor for every dense attention call (it was one FILL kernel per layer application)
+    ggml_tensor * zero_sinks = nullptr;
+    // local: [base, swa] the mask of the far attention calls, shared by the calls of a graph
+    ggml_tensor * far_mask[2] = { nullptr, nullptr };
+    // local: the row of -1 that folds the sinks into the far relative-bias product (see rel_far)
+    ggml_tensor * far_minus_one = nullptr;
 
     // each pass of the looped core restarts from the prelude state and reads the previous pass's blocks through messages
     const int64_t n_loop_core = hparams.loop_n_pass > 1 ? hparams.loop_core_end - hparams.loop_core_start : 0;
@@ -389,12 +528,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 ggml_tensor * q_kv   = ggml_view_2d(ctx0, model.loop_kv_res_query, n_embd, 2, model.loop_kv_res_query->nb[1], row*model.loop_kv_res_query->nb[1]);
 
                 // rows: (attn, mlp) and (k, v)
-                ggml_tensor * m_attn = mix(bank, bank_last, q_attn);
-                ggml_tensor * m_kv   = mix(bank, bank_last, q_kv);
+                ggml_tensor * m_attn = mix_rows(mix(bank, bank_last, q_attn));
+                ggml_tensor * m_kv   = mix_rows(mix(bank, bank_last, q_kv));
 
                 for (int j = 0; j < 2; ++j) {
-                    messages[j == 0 ? 0 : 3] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_attn, n_embd, n_tokens, m_attn->nb[2], j*m_attn->nb[1]));
-                    messages[j == 0 ? 1 : 2] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_kv,   n_embd, n_tokens, m_kv->nb[2],   j*m_kv->nb[1]));
+                    messages[j == 0 ? 0 : 3] = mix_row(m_attn, j);
+                    messages[j == 0 ? 1 : 2] = mix_row(m_kv, j);
                 }
             }
         }
@@ -416,9 +555,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
         ggml_tensor * inputs[3] = {cur, cur, cur};
         if (layer.attn_res_query) {
-            ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
+            ggml_tensor * mixed = mix_rows(mix(blocks, cur, layer.attn_res_query));
             for (int j = 0; j < 3; ++j) {
-                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+                // SWA layers have one query: the three inputs are the same row (one view, one copy at most)
+                inputs[j] = is_swa && j > 0 ? inputs[0] : mix_row(mixed, is_swa ? 0 : j);
             }
         }
 
@@ -474,7 +614,105 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
             ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-            if (use_banded(il, is_swa)) {
+            if (use_far(il, is_swa)) {
+                // local (RDNA3): relative bias inside the WMMA kernel. rel = [bias - sink ; -sink] by distance, the last row
+                // for every distance past the extent, plus a sink of logit 0: the dense formulation below without the
+                // n_kv x n_tokens x n_head mask. K/V and the mask are viewed up to the next multiple of 256 cells.
+                const auto * cache = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+                auto * k_rot = is_swa ? attn->self_k_rot_swa[il] : attn->self_k_rot[il];
+                auto * v_rot = is_swa ? attn->self_v_rot_swa[il] : attn->self_v_rot[il];
+                if (k_rot) {
+                    Qcur = llama_mul_mat_hadamard(ctx0, Qcur, k_rot);
+                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
+                }
+                if (v_rot) {
+                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
+                }
+                ggml_build_forward_expand(gf, Qcur);
+                ggml_build_forward_expand(gf, Kcur);
+                ggml_build_forward_expand(gf, Vcur);
+                ggml_build_forward_expand(gf, cache->cpy_k(ctx0, Kcur, is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
+                ggml_build_forward_expand(gf, cache->cpy_v(ctx0, Vcur, is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
+
+                const int64_t n_kv_b = inp->n_kv_banded[is_swa];
+                const int64_t n_kv_p = GGML_PAD(n_kv_b, 256);
+                ggml_tensor * k_all = cache->get_k(ctx0, il);
+                ggml_tensor * v_all = cache->get_v(ctx0, il);
+                GGML_ASSERT(n_kv_p <= k_all->ne[2]);
+                ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, Qcur, n_embd_head, n_head, n_tokens, 1), 0, 2, 1, 3);
+                ggml_tensor * k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv_p, k_all->ne[3],
+                        k_all->nb[1], k_all->nb[2], k_all->nb[3], 0), 0, 2, 1, 3);
+                ggml_tensor * v_fa;
+                if (v_all->nb[1] > v_all->nb[2]) { // transposed V
+                    v_fa = ggml_view_4d(ctx0, v_all, n_kv_p, v_all->ne[1], v_all->ne[2], v_all->ne[3],
+                            v_all->nb[1], v_all->nb[2], v_all->nb[3], 0);
+                    v_fa = ggml_transpose(ctx0, ggml_permute(ctx0, v_fa, 0, 2, 1, 3));
+                } else {
+                    v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_p, v_all->ne[3],
+                            v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
+                }
+                ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+                // local: the mask built on the device from relative positions (see kq_dev), n_kv_p columns, once per cache
+                if (inp->kq_dev[is_swa]) {
+                    ggml_tensor *& g = inp->kq_mask_gen[is_swa];
+                    if (!g) {
+                        const int64_t nq = mask->ne[1];
+                        // clamp(k - q, 0, 1): 1 where the cell is kept, 0 where it is masked
+                        const auto keep = [&](ggml_tensor * k, ggml_tensor * q) {
+                            ggml_tensor * t = ggml_repeat_4d(ctx0, ggml_view_1d(ctx0, k, n_kv_p, 0), n_kv_p, nq, 1, 1);
+                            return ggml_clamp(ctx0, ggml_sub_inplace(ctx0, t, q), 0.0f, 1.0f);
+                        };
+                        ggml_tensor * t = keep(inp->kq_k_neg[is_swa], inp->kq_q_neg1);
+                        if (is_swa) {
+                            t = ggml_mul_inplace(ctx0, t, keep(inp->kq_k_pos, inp->kq_q_swa));
+                        }
+                        g = ggml_log_inplace(ctx0, t);
+                    }
+                    mask = g;
+                }
+                // local: the mask is the same for every call of a cache: one view (the whole mask when no padding cell is
+                // cut, the usual case) or one copy per graph instead of a copy per attention call (8 copies of up to
+                // 128 MiB at a full context for the global layers). INKLING2_FAR_MASK_COPY=1 restores the copy per call.
+                static const bool far_mask_copy = std::getenv("INKLING2_FAR_MASK_COPY") != nullptr;
+                ggml_tensor *& m = far_mask[is_swa];
+                if (!m || far_mask_copy) {
+                    m = n_kv_p == mask->ne[0] && !far_mask_copy ? mask :
+                        ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_p, mask->ne[1], mask->ne[2], mask->ne[3],
+                            mask->nb[1], mask->nb[2], mask->nb[3], 0));
+                }
+                ggml_tensor * rel_far = nullptr;
+                // local: the sink is folded into the table product as a 17th term (a row of -1 under the bias table, the
+                // sinks under r) instead of a SUB that read and wrote the whole [E + 1, n_head, n_tokens] F32 table again
+                // (100 MB per call for a 1024-token batch). INKLING2_REL_SUB=1 restores the SUB.
+                static const bool rel_sub = std::getenv("INKLING2_REL_SUB") != nullptr;
+                if (!rel_sub) {
+                    if (!far_minus_one) {
+                        far_minus_one = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, layer.attn_rel_bias->ne[1] + 1), -1.0f);
+                    }
+                    ggml_tensor * table = ggml_concat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), far_minus_one, 0);
+                    ggml_tensor * r_s   = ggml_concat(ctx0, Rcur, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens), 0);
+                    // local: one flat product over the n_head x n_tokens columns; with the table broadcast over the tokens the
+                    // backend ran one small GEMM per token (RDNA3, 1024-token batch: 252 us instead of 80 us per call).
+                    // INKLING2_REL_FLAT=0 restores the broadcast form.
+                    static const bool rel_flat = []() { const char * e = std::getenv("INKLING2_REL_FLAT"); return !e || atoi(e) != 0; }();
+                    if (rel_flat) {
+                        r_s = ggml_reshape_2d(ctx0, r_s, r_s->ne[0], r_s->ne[1]*r_s->ne[2]);
+                    }
+                    rel_far = ggml_mul_mat(ctx0, table, r_s);
+                } else {
+                    rel_far = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+                    rel_far = ggml_sub(ctx0, rel_far, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+                }
+                rel_far = ggml_reshape_4d(ctx0, rel_far, rel_far->ne[0], n_head, n_tokens, 1);
+                cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_far, 1.0f/sqrtf(n_embd_head), rel_far->ne[0]);
+                ggml_flash_attn_ext_banded_set_far_rot(cur, n_kv_p - n_kv_b, inp->kv_rot[is_swa]);
+                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+                cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+                cb(cur, "kqv_out", il);
+                if (v_rot) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+                }
+            } else if (n_tokens > n_tokens_banded_min && use_banded(il, is_swa) && banded_generic_ok(il, is_swa)) {
                 const auto * cache = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
                 auto * k_rot = is_swa ? attn->self_k_rot_swa[il] : attn->self_k_rot[il];
                 auto * v_rot = is_swa ? attn->self_v_rot_swa[il] : attn->self_v_rot[il];
@@ -523,6 +761,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
                 }
             } else {
+                // local: r and the sinks go into the graph first, so that the bias chain below (PAD ... cast of the mask) is
+                // contiguous and the backend can fuse it into one kernel
+                ggml_build_forward_expand(gf, Rcur);
+                ggml_build_forward_expand(gf, sinks);
                 // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
                 ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
@@ -530,13 +772,17 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
                 table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
-                sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+                if (!zero_sinks || zero_sinks->ne[0] != n_head || mix_row_cont) {
+                    zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+                }
+                sinks = zero_sinks;
 
                 // the dense bias is n_kv x n_tokens x n_head: past the budget, attend in chunks of query rows
                 const int64_t n_seq_tokens = n_tokens/n_stream;
                 // sized for a full cache so the chunking does not change while it fills
                 const int64_t n_kv_max = std::max<int64_t>(n_kv, (is_swa ? attn->mctx->get_swa() : attn->mctx->get_base())->get_size());
-                int64_t n_rows_max = std::max({ int64_t(1), n_kq_bias_max/(n_kv_max*n_head*n_stream),
+                const int64_t kq_bias_max = far_probe(il, is_swa) ? n_kq_bias_max_far : n_kq_bias_max;
+                int64_t n_rows_max = std::max({ int64_t(1), kq_bias_max/(n_kv_max*n_head*n_stream),
                         (n_seq_tokens + n_kq_chunk_max - 1)/n_kq_chunk_max });
                 if (n_rows_max < n_seq_tokens) {
                     // equal chunks of whole 64-row tiles
@@ -573,6 +819,17 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                                 rel_pos_dev->nb[1], n_seq_tokens*rel_pos_dev->nb[1], r0*rel_pos_dev->nb[1]);
                         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, ggml_get_rows(ctx0, table_c, rel_pos_c), 2, 0, 1, 3));
                     }
+                    // local TIMING EXPERIMENT ONLY (wrong output): INKLING2_NOBIAS=1 drops the relative bias so that the mask keeps
+                    // no head dimension; it measures what attention costs without building the dense per-head bias. Only in
+                    // builds with GGML_CUDA_INK2_COST_TOOLS defined.
+#if defined(GGML_CUDA_INK2_COST_TOOLS)
+                    static const bool no_bias = std::getenv("INKLING2_NOBIAS") != nullptr;
+#else
+                    static const bool no_bias = false;
+#endif
+                    if (no_bias) {
+                        kq_b = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, nr, 1, n_stream), 0.0f);
+                    }
                     cb(kq_b, "kq_b", il);
 
                     // only the first chunk stores K and V
@@ -604,6 +861,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             blocks.push_back(inpSA);
         } else {
             cur = ggml_add(ctx0, inpSA, cur);
+            // local: right after the convolution (fused with it, see convolve)
+            ggml_build_forward_expand(gf, cur);
         }
 
         ggml_tensor * ffn_inp = cur;
@@ -639,6 +898,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, ffn_inp, cur);
+        // local: right after the convolution (fused with it, see convolve)
+        ggml_build_forward_expand(gf, cur);
         cb(cur, "l_out", il);
     }
 

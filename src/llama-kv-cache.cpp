@@ -1355,6 +1355,107 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return pos_max + 1;
 }
 
+uint32_t llama_kv_cache::get_n_kv_pos_rotated(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & rot) const {
+    rot = 0;
+    if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0 ||
+        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr ||
+        ubatch.seq_id == nullptr || ubatch.seq_id[0] == nullptr) {
+        return 0;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (sinfo.strm[0] < 0 || (uint32_t) sinfo.strm[0] != stream || stream >= v_cells.size()) {
+        return 0;
+    }
+
+    const auto &   cells   = v_cells[stream];
+    const uint32_t size    = cells.size();
+    const llama_pos pos_max = cells.seq_pos_max(seq_id);
+
+    // local diagnostic: INKLING2_RING_LOG=1 prints why a ubatch of more than 8 tokens cannot read the ring as rotated
+    static const bool ring_log = std::getenv("INKLING2_RING_LOG") != nullptr;
+    const auto why = [&](const char * reason, int64_t a, int64_t b) {
+        if (ring_log && ubatch.n_tokens > 8) {
+            uint32_t n_empty = 0;
+            for (uint32_t j = 0; j < size; ++j) {
+                n_empty += cells.is_empty(j);
+            }
+            LLAMA_LOG_WARN("%s: ring not rotated (%s %lld %lld): size %u, empty %u, seq pos [%d, %d], ubatch %u tokens from pos %d\n",
+                __func__, reason, (long long) a, (long long) b, size, n_empty, cells.seq_pos_min(seq_id), pos_max,
+                ubatch.n_tokens, ubatch.pos[0]);
+            // runs of cells holding consecutive positions: cell range -> position range
+            std::string runs;
+            uint32_t j0 = 0;
+            for (uint32_t j = 1; j <= size; ++j) {
+                const bool brk = j == size || cells.is_empty(j) != cells.is_empty(j0) ||
+                    (!cells.is_empty(j) && cells.pos_get(j) != cells.pos_get(j - 1) + 1);
+                if (brk) {
+                    char buf[96];
+                    if (cells.is_empty(j0)) {
+                        snprintf(buf, sizeof(buf), " [%u-%u empty]", j0, j - 1);
+                    } else {
+                        snprintf(buf, sizeof(buf), " [%u-%u: %d-%d]", j0, j - 1, cells.pos_get(j0), cells.pos_get(j - 1));
+                    }
+                    runs += buf;
+                    j0 = j;
+                }
+            }
+            LLAMA_LOG_WARN("%s: ring runs:%s\n", __func__, runs.c_str());
+        }
+        return 0u;
+    };
+
+    // a ring whose used cells, read from the cell holding the oldest position, hold consecutive positions and are followed
+    // by empty cells only (local: not necessarily full, e.g. right after a checkpoint restore; the empty cells are the
+    // padding at the logical end, n_kv_pad), the ubatch being its newest positions
+    if (pos_max < 0) {
+        return 0;
+    }
+    const llama_pos pos_min = cells.seq_pos_min(seq_id);
+    const uint32_t  n_used  = (uint32_t) (pos_max - pos_min + 1);
+    if (pos_min < 0 || n_used > size || n_used < ubatch.n_tokens) {
+        return why("ring smaller than the ubatch", n_used, ubatch.n_tokens);
+    }
+    const llama_pos pos_start = pos_max + 1 - (llama_pos) ubatch.n_tokens;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != pos_start + (llama_pos) i ||
+            ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
+            return why("ubatch not the tail", i, ubatch.pos[i]);
+        }
+    }
+
+    uint32_t r = size;
+    for (uint32_t j = 0; j < size; ++j) {
+        if (!cells.is_empty(j) && cells.pos_get(j) == pos_min) {
+            r = j;
+            break;
+        }
+    }
+    if (r == size) {
+        return why("oldest position missing", pos_min, 0);
+    }
+    for (uint32_t i = 0; i < n_used; ++i) {
+        const uint32_t j = (r + i) % size;
+        if (cells.is_empty(j) || cells.pos_get(j) != pos_min + (llama_pos) i || !cells.seq_has(j, seq_id)) {
+            return why("cell out of order", i, cells.is_empty(j) ? -1 : cells.pos_get(j));
+        }
+    }
+    for (uint32_t i = n_used; i < size; ++i) {
+        const uint32_t j = (r + i) % size;
+        if (!cells.is_empty(j)) {
+            return why("cell after the newest position not empty", i, cells.pos_get(j));
+        }
+    }
+
+    rot = r;
+    return n_used;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -2080,6 +2181,29 @@ void llama_kv_cache::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatc
     }
 }
 
+void llama_kv_cache::set_input_kq_rel_pos(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t lo, int32_t hi, float sign) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && ggml_backend_buffer_is_host(dst->buffer));
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    llama_pos p_min = ubatch->pos[0];
+    for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch->pos[i]);
+    }
+
+    ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+
+    const int64_t n_kv = dst->ne[0];
+    for (int64_t j = 0; j < n_kv; ++j) {
+        int64_t r = hi;
+        if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+            r = std::clamp<int64_t>((int64_t) cells.pos_get(j) - p_min, lo, hi);
+        }
+        data[j] = ggml_fp32_to_fp16(sign*(float) r);
+    }
+}
+
 bool llama_kv_cache::has_cell_ext() const {
     // M-RoPE needs the 2D position, the PLE / Engram n-gram hashes need the token id
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
@@ -2610,6 +2734,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         ubatch.seq_id_unq[0] = dest_seq_id;
 
+        // local: head after the restore when the cells are put back in position order (see below)
+        uint32_t head_after = UINT32_MAX;
+
         // the ext as it was saved, to put back after apply_ubatch()
         std::vector<llama_kv_cell_ext> exts;
         if (has_cell_ext()) {
@@ -2685,12 +2812,38 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;
             }
+
+            // local: a sequence is saved in cell order, which carries the rotation of a ring (SWA cache): restored in that order,
+            // the cells of the window come back rotated inside the slot and the ubatches that extend it no longer form one
+            // rotation, so the far attention falls back to the dense bias after every checkpoint restore (a follow-up prompt
+            // after speculative decoding: ~1000 tok/s instead of ~2000). The slot cells, in the order find_slot gave them (from
+            // the head, wrapping), now receive the positions in increasing order; state_read_data writes the rows by these
+            // cells. Inkling 2 only (the model whose far attention reads the ring as one rotation); other models keep the
+            // saved order. INKLING2_RESTORE_ORDER=0 restores the saved order.
+            static const bool restore_order = []() { const char * e = std::getenv("INKLING2_RESTORE_ORDER"); return !(e && e[0] == '0'); }();
+            if (restore_order && model.arch == LLM_ARCH_INKLING2 && swa_type != LLAMA_SWA_TYPE_NONE && sinfo.n_stream() == 1 &&
+                    sinfo.idxs[0].size() == cell_count) {
+                std::vector<uint32_t> order(cell_count);
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    order[i] = i;
+                }
+                std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return ubatch.pos[a] < ubatch.pos[b]; });
+                const std::vector<uint32_t> slot = sinfo.idxs[0];
+                for (uint32_t k = 0; k < cell_count; ++k) {
+                    sinfo.idxs[0][order[k]] = slot[k];
+                }
+                head_after = slot.back() + 1;
+            }
         }
 
         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+        // local: with the cells in position order, the next ubatches continue after the last cell of the slot
+        if (head_after != UINT32_MAX) {
+            head = head_after;
+        }
 
         // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
         // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
@@ -3143,6 +3296,23 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     return result <= (uint32_t) n_kv ? result : 0;
 }
 
+uint32_t llama_kv_cache_context::get_n_kv_banded(uint32_t & rot, const bool allow_rot) const {
+    rot = 0;
+    const uint32_t n = get_n_kv_pos_contiguous();
+    if (n > 0 || !allow_rot || ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        return n;
+    }
+    uint32_t r = 0;
+    const uint32_t result = kv->get_n_kv_pos_rotated(sinfos[i_cur], ubatches[i_cur], r);
+    // the view of K/V must be the whole ring: the used cells padded to 256 (local: the empty cells of a ring that is not
+    // full are the padding at the logical end, fewer than 256 of them)
+    if (result == 0 || GGML_PAD(result, 256) != (uint32_t) n_kv || (uint32_t) n_kv != kv->get_size()) {
+        return 0;
+    }
+    rot = r;
+    return result;
+}
+
 uint32_t llama_kv_cache_context::get_size() const {
     return kv->get_size();
 }
@@ -3221,6 +3391,10 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_pos_rel_flat(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_kq_rel_pos(ggml_tensor * dst, const llama_ubatch * ubatch, int32_t lo, int32_t hi, float sign) const {
+    kv->set_input_kq_rel_pos(dst, ubatch, lo, hi, sign);
 }
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
