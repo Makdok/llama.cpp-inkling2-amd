@@ -929,6 +929,37 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            // local diagnostic: GGML_ALLOC_TOP=<MiB> lists the graph nodes of at least that size when a buffer is (re)allocated
+            {
+                static int top_mib = -1;
+                if (top_mib < 0) {
+                    const char * e = getenv("GGML_ALLOC_TOP");
+                    top_mib = e ? atoi(e) : 0;
+                }
+                if (top_mib > 0) {
+                    fprintf(stderr, "alloc top: %s buffer -> %.2f MiB, graph of %d nodes:\n", ggml_backend_buft_name(galloc->bufts[i]),
+                        new_size / 1024.0 / 1024.0, graph->n_nodes);
+                    for (int n = 0; n < graph->n_nodes; n++) {
+                        const struct ggml_tensor * t = graph->nodes[n];
+                        if (ggml_nbytes(t) >= (size_t) top_mib << 20 && t->view_src == NULL) {
+                            fprintf(stderr, "  %8.2f MiB  %-12s %s [%lld, %lld, %lld, %lld]\n", ggml_nbytes(t) / 1024.0 / 1024.0,
+                                ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+                        }
+                    }
+                }
+            }
+            // local diagnostic: GGML_ALLOC_GROWTH=1 prints every growth of an already allocated compute buffer
+            {
+                static int growth_log = -1;
+                if (growth_log < 0) {
+                    growth_log = getenv("GGML_ALLOC_GROWTH") != NULL;
+                }
+                const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                if (growth_log && cur_size > 0) {
+                    fprintf(stderr, "alloc growth: %s buffer %.2f -> %.2f MiB (graph of %d nodes)\n",
+                        ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0, graph->n_nodes);
+                }
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;

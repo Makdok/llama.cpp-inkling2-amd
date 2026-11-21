@@ -1308,6 +1308,12 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
+        // local (bench only): INKLING2_N_RS_SEQ sets the rollback depth, to measure the graph that the server builds for a
+        // target model under speculative decoding (n_rs_seq = draft n-max)
+        if (const char * e = getenv("INKLING2_N_RS_SEQ")) {
+            cparams.n_rs_seq = (uint32_t) atoi(e);
+        }
+
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
@@ -2209,6 +2215,26 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
     common_batch batch(ctx);
     llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+
+    // local: LLAMA_BENCH_GEN_BATCH=B decodes B tokens per step, all with logits, like the verify batches of speculative
+    // decoding (the graph is reused from step to step, unlike a -p B test after a depth fill); n_gen counts tokens
+    static const int gen_batch = []() { const char * e = getenv("LLAMA_BENCH_GEN_BATCH"); return e ? std::max(1, atoi(e)) : 1; }();
+    if (gen_batch > 1) {
+        for (int i = 0; i < n_gen; i += gen_batch) {
+            batch.clear();
+            for (int j = 0; j < gen_batch; ++j) {
+                batch.add(j == 0 ? token : std::rand() % n_vocab, pos++, 0, true);
+            }
+            int res = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (res != 0) {
+                fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
+                return false;
+            }
+            llama_synchronize(ctx);
+            token = std::rand() % n_vocab;
+        }
+        return true;
+    }
 
     for (int i = 0; i < n_gen; i++) {
         batch.clear();
