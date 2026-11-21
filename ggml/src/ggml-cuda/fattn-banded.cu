@@ -839,8 +839,8 @@ static bool fattn_banded_type_supported(ggml_type type) {
 }
 
 bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * dst) {
-    GGML_UNUSED(device);
 #if defined(GGML_USE_MUSA)
+    GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
 #else
@@ -880,6 +880,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     }
     const ggml_tensor * sinks = dst->src[4];
     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
+        return false;
+    }
+    // far mode: only the MMA/WMMA kernel implements it
+    if (((const float *) dst->op_params)[6] != 0.0f && !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
         return false;
     }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&

@@ -5595,6 +5595,34 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_banded_set_far(struct ggml_tensor * a, int64_t n_kv_pad) {
+    ggml_flash_attn_ext_banded_set_far_rot(a, n_kv_pad, 0);
+}
+
+// local: op_params[6] = 1 + n_kv_pad + 256*rot (n_kv_pad < 256, rot < 2048): K/V is a ring whose cell k holds the logical
+// key (k - rot) mod n_kv (an SWA cache that has wrapped); rot = 0 is the plain far mode
+void ggml_flash_attn_ext_banded_set_far_rot(struct ggml_tensor * a, int64_t n_kv_pad, int64_t rot) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(n_kv_pad >= 0 && n_kv_pad < 256);
+    GGML_ASSERT(rot >= 0 && rot < 2048);
+    ((float *) a->op_params)[6] = 1.0f + (float) (n_kv_pad + 256*rot);
+}
+
+int64_t ggml_flash_attn_ext_banded_get_far_pad(const struct ggml_tensor * a) {
+    const float f = a->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? ((const float *) a->op_params)[6] : 0.0f;
+    return f >= 1.0f ? ((int64_t) f - 1) % 256 : 0;
+}
+
+int64_t ggml_flash_attn_ext_banded_get_far_rot(const struct ggml_tensor * a) {
+    const float f = a->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? ((const float *) a->op_params)[6] : 0.0f;
+    return f >= 1.0f ? ((int64_t) f - 1) / 256 : 0;
+}
+
+bool ggml_flash_attn_ext_banded_get_far(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT_BANDED && ((const float *) a->op_params)[6] != 0.0f;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

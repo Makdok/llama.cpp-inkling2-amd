@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "inkling2-fused.cuh" // ggml_cuda_ink2_arch_ok
 
 #if !defined(GGML_USE_MUSA)
 
@@ -259,6 +260,24 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On RDNA it is preferable to minimize wasted compute vs. duplicate I/O for the mask.
     if (amd_wmma_available(cc)) {
+#if defined(GGML_USE_HIP)
+        // local (RDNA3): GQA ratio 3 as 3 heads per tile instead of 4 with a padding column (a quarter less work).
+        // GGML_CUDA_INK2_FA_GQA3 = 0 off, 16 or 32 = queries per tile (wider tiles need batches of more than 32 tokens).
+        if constexpr (DKQ == 128 && DV == 128) {
+            static const int gqa3 = [] {
+                const char * e = getenv("GGML_CUDA_INK2_FA_GQA3");
+                return e ? atoi(e) : 16;
+            }();
+            if (use_gqa_opt && gqa_ratio == 3 && gqa3 > 0 && Q->ne[1] > 16 && ggml_cuda_ink2_arch_ok(ggml_cuda_get_device())) {
+                if (gqa3 >= 32 && Q->ne[1] > 32) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, 3>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16, 3>(ctx, dst);
+                }
+                return;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
@@ -609,6 +628,27 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
         return false;
     }
 
+    // local (RDNA3): the far mode (rel carries the far bias and the folded sink) runs on the WMMA kernel; the mask must be
+    // shared by the heads and K/V padded, as for the GQA optimization, and the batch large enough for the wide tiles. Only
+    // run on RDNA3 (ggml_cuda_ink2_arch_ok): other GPUs report the far mode unsupported and the model takes its stock path.
+    if (((const float *) dst->op_params)[6] != 0.0f) {
+        const ggml_tensor * mask = dst->src[3];
+        if (!(amd_wmma_available(ggml_cuda_info().devices[device].cc) && ggml_cuda_ink2_arch_ok(device) && mask && mask->ne[2] == 1 &&
+                K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= 1 && Q->ne[2] / K->ne[2] > 1)) {
+            return false;
+        }
+        // same alignment rule as the GQA optimization: without it the dispatch would pick ncols2 = 1,
+        // a variant that is not compiled for WMMA
+        for (const ggml_tensor * t : {Q, K, V, mask}) {
+            for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+                if (t->nb[i] % 16 != 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     return turing_mma_available(ggml_cuda_info().devices[device].cc);
 }
 
@@ -800,9 +840,30 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+    // local (RDNA3): a mask with a head dimension (Inkling 2 relative bias) disables the GQA optimization, which sent prefill
+    // to the tile kernel. GGML_HIP_FATTN_WMMA_HEADMASK=N lets WMMA take it from N query rows up (0/unset = off); experimental
+    // (can hang the GPU), only in builds with GGML_CUDA_INK2_COST_TOOLS.
+#if defined(GGML_CUDA_INK2_COST_TOOLS)
+    static const int wmma_headmask_min_q = []() {
+        const char * e = getenv("GGML_HIP_FATTN_WMMA_HEADMASK");
+        return e ? atoi(e) : 0;
+    }();
+#else
+    static const int wmma_headmask_min_q = 0;
+#endif
+    const bool wmma_headmask = wmma_headmask_min_q > 0 && mask && mask->ne[2] != 1 && max_bias == 0.0f &&
+        n_kv % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= wmma_headmask_min_q;
+    if ((amd_wmma_available(cc) && (gqa_opt_applies || wmma_headmask) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // local (RDNA3 only, ggml_cuda_ink2_arch_ok): a single query row with a per-head mask (Inkling 2 decode) goes to the tile
+    // kernel, faster than the vector kernel at long context (test-backend-ops perf, 24/8 heads, 51200 keys: 245 us instead of
+    // 312; server decode after 51k: 15.4 -> 14.9 ms per token). GGML_CUDA_INK2_FA_TILE1=0 restores the vector kernel.
+    static const bool ink2_fa_tile1 = []() { const char * e = getenv("GGML_CUDA_INK2_FA_TILE1"); return !(e && e[0] == '0'); }();
+    if (ink2_fa_tile1 && ggml_cuda_ink2_arch_ok(device) && mask && mask->ne[2] != 1 && Q->ne[1] == 1) {
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // If there are no tensor cores available, use the generic tile kernel:

@@ -774,6 +774,48 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+// local (Inkling far kernel): per query tile of ncols1 rows, one bit per K/V block of nbatch_fa cells (at most 64 blocks,
+// two words) that holds at least one unmasked value of a valid row; the kernel skips the other blocks
+template <int ncols1>
+__launch_bounds__(256, 1)
+static __global__ void flash_attn_mask_to_live_blocks(
+        const half * mask_ptr, uint32_t * live_ptr, const int n_kv, const int nbatch_fa, const int ne31, const int64_t s31, const int64_t s33) {
+    const int sequence = blockIdx.y;
+    const int jt       = blockIdx.x;
+
+    const half * GGML_CUDA_RESTRICT mask = mask_ptr + sequence*s33 + int64_t(jt)*ncols1*s31;
+    const int nrows = min(ncols1, ne31 - jt*ncols1);
+
+    __shared__ unsigned int live_s[2];
+    if (threadIdx.x < 2) {
+        live_s[threadIdx.x] = 0;
+    }
+    ggml_cuda_pdl_sync();
+    __syncthreads();
+
+    uint64_t live = 0;
+    for (int c = threadIdx.x; c < n_kv; c += blockDim.x) {
+        bool any = false;
+        for (int j = 0; j < nrows && !any; ++j) {
+            any = !isinf(__half2float(mask[j*s31 + c]));
+        }
+        if (any) {
+            live |= uint64_t(1) << (c / nbatch_fa);
+        }
+    }
+    if (live & 0xFFFFFFFFu) {
+        atomicOr(&live_s[0], (unsigned int) (live & 0xFFFFFFFFu));
+    }
+    if (live >> 32) {
+        atomicOr(&live_s[1], (unsigned int) (live >> 32));
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 2) {
+        live_ptr[2*(int64_t(sequence)*gridDim.x + jt) + threadIdx.x] = live_s[threadIdx.x];
+    }
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
@@ -1032,7 +1074,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false, const bool live_blocks = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1171,7 +1213,19 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
-    const bool scan_mask = !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+    // local (Inkling far kernel with single-stage loading, see flash_attn_ext_f16): two words per query tile after the
+    // KV_max values, a bit per K/V block of nbatch_fa cells with an unmasked value; the kernel skips the other blocks, e.g.
+    // the masked half of a SWA ring (window n_swa in a ring of n_swa + n_ubatch cells, rotated: the masked cells are not only
+    // at the end). The kernel expects them whenever scan_mask, far and at most 64 blocks: GGML_CUDA_INK2_FA_LIVE=0 marks
+    // every block live instead of scanning. Such a far op scans its mask from 256 query rows on (a 512-token ubatch too).
+    // Not bit-exact: the far kernel bumps its running max at every block once the row sum passes 4 (fp16 accumulator), a
+    // skipped block no longer does, which changes the rounding only.
+    const bool far_op   = rel && ((const float *) KQV->op_params)[6] != 0.0f;
+    const bool far_live = live_blocks && far_op && (n_kv_cols + nbatch_fa - 1)/nbatch_fa <= 64;
+    const bool scan_mask = !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 &&
+        (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows || (far_live && Q->ne[1] >= 256));
+    const bool live_on = far_live && scan_mask;
+
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1182,11 +1236,59 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = n_kv_cols / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
+        KV_max.alloc(live_on ? 3*ne_KV_max : ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
+
+        if (live_on) {
+            static const bool live_scan = []() { const char * e = getenv("GGML_CUDA_INK2_FA_LIVE"); return !(e && e[0] == '0'); }();
+            uint32_t * live = (uint32_t *) (KV_max.ptr + ne_KV_max);
+            if (live_scan) {
+                const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(blocks_num_KV_max, dim3(256, 1, 1), 0, main_stream);
+                ggml_cuda_kernel_launch(flash_attn_mask_to_live_blocks<ncols1>, lp,
+                    (const half *) mask->data, live, int(n_kv_cols), nbatch_fa, int(mask->ne[1]),
+                    int64_t(mask->nb[1] / sizeof(half)), int64_t(mask->nb[3] / sizeof(half)));
+                CUDA_CHECK(cudaGetLastError());
+
+                // local DEBUG: GGML_CUDA_INK2_FA_LIVE=2 recomputes the bits on the host from the mask and counts mismatches
+                // (synchronizes the stream: run it with GGML_CUDA_DISABLE_GRAPHS=1)
+                static const bool live_debug = []() { const char * e = getenv("GGML_CUDA_INK2_FA_LIVE"); return e && e[0] == '2'; }();
+                if (live_debug) {
+                    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+                    std::vector<uint16_t> hm(ggml_nbytes(mask)/sizeof(uint16_t));
+                    std::vector<uint32_t> hl(2*ne_KV_max);
+                    CUDA_CHECK(cudaMemcpy(hm.data(), mask->data, ggml_nbytes(mask), cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(hl.data(), live, hl.size()*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                    const int64_t sm1 = mask->nb[1]/sizeof(uint16_t), sm3 = mask->nb[3]/sizeof(uint16_t);
+                    static int64_t n_calls = 0, n_bad = 0, n_dead = 0, n_tiles = 0;
+                    for (int64_t s = 0; s < Q->ne[3]; ++s) {
+                        for (int64_t jt = 0; jt < ntiles_x; ++jt) {
+                            const int64_t i = 2*(s*ntiles_x + jt);
+                            const uint64_t bits = uint64_t(hl[i]) | (uint64_t(hl[i + 1]) << 32);
+                            for (int64_t t = 0; t*nbatch_fa < n_kv_cols; ++t) {
+                                bool any = false;
+                                for (int64_t j = jt*ncols1; j < std::min<int64_t>((jt + 1)*ncols1, mask->ne[1]) && !any; ++j) {
+                                    for (int64_t c = t*nbatch_fa; c < std::min<int64_t>((t + 1)*nbatch_fa, n_kv_cols) && !any; ++c) {
+                                        any = (hm[(s % mask->ne[3])*sm3 + j*sm1 + c] & 0x7FFF) != 0x7C00;
+                                    }
+                                }
+                                n_bad  += any != bool((bits >> t) & 1);
+                                n_dead += !any;
+                                n_tiles++;
+                            }
+                        }
+                    }
+                    if (++n_calls % 50 == 0 || n_bad) {
+                        fprintf(stderr, "ink2 fa live: %lld calls, %lld/%lld blocks dead, %lld mismatches (n_q %lld, n_kv %lld)\n",
+                            (long long) n_calls, (long long) n_dead, (long long) n_tiles, (long long) n_bad, (long long) Q->ne[1], (long long) n_kv_cols);
+                    }
+                }
+            } else {
+                CUDA_CHECK(cudaMemsetAsync(live, 0xFF, size_t(2*ne_KV_max)*sizeof(uint32_t), main_stream));
+            }
+        }
     }
 
     // K/V are shared by all slices when read through kv_rows
@@ -1311,7 +1413,12 @@ void launch_fattn(
 
     // m0/m1 are unused for banded bias; the negative tag would otherwise blow up the exponent
     const float m0 = rel ? 1.0f : powf(2.0f, -(max_bias       ) / n_head_log2);
-    const float m1 = rel ? 1.0f : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    // far banded bias (op_params[6] = 1 + n_kv_pad, see ggml_flash_attn_ext_banded_set_far): tagged for the kernel by
+    // m1 = 2 + n_kv_pad, the number of padding cells at the end of K/V that Q is not aligned to
+    // (local: + 256*rot for a rotated ring, see ggml_flash_attn_ext_banded_set_far_rot; n_kv_pad < 256, rot < 2048)
+    const float rel_far = rel ? ((const float *) KQV->op_params)[6] : 0.0f;
+    GGML_ASSERT(rel_far == 0.0f || (rel->ne[0] < 4096 && rel_far >= 1.0f && rel_far <= float(1 << 19)));
+    const float m1 = rel ? 1.0f + rel_far : powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);

@@ -918,6 +918,18 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
     const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
     return static_cast<float>(xf) / 2;
 #else
+#if defined(GGML_USE_HIP) && defined(RDNA3)
+    // local (RDNA3 device code only, measured on gfx1100): the same values without ldexpf or branches (NVFP4 scales, once per
+    // 16 weights): a normal value 2^(e - 7)*(1 + m/8)/2 is the float with exponent e + 119 and mantissa m << 20, a subnormal
+    // one is m*2^-10; the top bit is ignored and 0x7F (NaN) gives 0 as below. GGML_CUDA_INK2_UE4M3_LDEXP at build time
+    // restores ldexpf.
+#if !defined(GGML_CUDA_INK2_UE4M3_LDEXP)
+    const uint32_t ux    = uint32_t(x) & 0x7Fu;
+    const float    fnorm = __uint_as_float((ux << 20) + (119u << 23));
+    const float    fsub  = float(ux & 7u) * (1.0f/1024.0f);
+    return x == 0x7F ? 0.0f : (ux < 8u ? fsub : fnorm);
+#endif // !defined(GGML_CUDA_INK2_UE4M3_LDEXP)
+#endif // defined(GGML_USE_HIP) && defined(RDNA3)
     if (x == 0 || (x == 0x7F && x != 0xFF)) { // Convert NaN to 0.0f
         return 0.0f;
     }

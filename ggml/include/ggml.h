@@ -2309,6 +2309,17 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // far mode of ggml_flash_attn_ext_banded (local addition): the last row of rel_logits applies to every distance
+    // from rel_extent - 1 up, and a sink of logit 0 is added. With rel = bias - sink (far row: -sink) this is the
+    // per-query-sink attention without a dense per-head mask. Must be set before sinks; no sinks may be added.
+    // n_kv_pad: padding cells at the end of K/V (and of the mask) that Q is not aligned to
+    GGML_API void ggml_flash_attn_ext_banded_set_far(struct ggml_tensor * a, int64_t n_kv_pad);
+    // local: far mode over a rotated ring of K/V cells (cell k = logical key (k - rot) mod n_kv); n_kv_pad < 256, rot < 2048
+    GGML_API void ggml_flash_attn_ext_banded_set_far_rot(struct ggml_tensor * a, int64_t n_kv_pad, int64_t rot);
+    GGML_API int64_t ggml_flash_attn_ext_banded_get_far_rot(const struct ggml_tensor * a);
+    GGML_API int64_t ggml_flash_attn_ext_banded_get_far_pad(const struct ggml_tensor * a);
+    GGML_API bool ggml_flash_attn_ext_banded_get_far(const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
