@@ -1255,6 +1255,23 @@ struct ggml_backend_sched {
     int n_prefetched;
     int prefetch_split;     // the split that reads the prefetched inputs
     int prefetch_backend_id; // the backend that copies them
+
+    // local: asynchronous uploads of the user inputs, see ggml_backend_sched_copy_input_async
+    ggml_backend_buffer_t in_stage     [GGML_SCHED_MAX_BACKENDS][2]; // pinned host staging memory, two generations
+    ggml_backend_event_t  in_stage_ev  [GGML_SCHED_MAX_BACKENDS][2]; // recorded after the last upload from each generation
+    bool                  in_stage_rec [GGML_SCHED_MAX_BACKENDS][2]; // that event was recorded at least once
+    size_t                in_stage_off [GGML_SCHED_MAX_BACKENDS];    // fill level of the open generation
+    size_t                in_stage_need[GGML_SCHED_MAX_BACKENDS];    // largest fill a generation asked for
+    int                   in_stage_gen [GGML_SCHED_MAX_BACKENDS];    // the open generation (0 or 1)
+    bool                  in_stage_open[GGML_SCHED_MAX_BACKENDS];    // a generation is open in this graph compute
+    bool                  in_stage_used[GGML_SCHED_MAX_BACKENDS];    // uploads queued since the last event record
+    signed char           in_async_ok  [GGML_SCHED_MAX_BACKENDS];    // 0 = not decided yet, 1 = yes, -1 = no
+    // batched form: the staged inputs of a split are queued here and uploaded by one backend call (ggml_backend_ink2_upload_n)
+    void *                in_upload_fn [GGML_SCHED_MAX_BACKENDS];    // NULL: one asynchronous copy per input
+    int                   in_pend_n    [GGML_SCHED_MAX_BACKENDS];
+    size_t                in_pend_off  [GGML_SCHED_MAX_BACKENDS][64]; // offset of the data in the open generation
+    struct ggml_tensor *  in_pend_dst  [GGML_SCHED_MAX_BACKENDS][64];
+    size_t                in_pend_size [GGML_SCHED_MAX_BACKENDS][64];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2074,17 +2091,33 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
+        const int64_t t0 = sched_time ? ggml_time_us() : 0;
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        const int64_t t1 = sched_time ? ggml_time_us() : 0;
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
+        const int64_t t2 = sched_time ? ggml_time_us() : 0;
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
+        }
+        if (sched_time && sched->graph.n_nodes >= 5000) {
+            static int64_t n = 0;
+            static double  tw = 0.0, tr = 0.0, ta = 0.0;
+            tw += (double) (t1 - t0);
+            tr += (double) (t2 - t1);
+            ta += (double) (ggml_time_us() - t2);
+            if (++n % 16 == 0) {
+                fprintf(stderr, "sched realloc: %lld graphs, wait for the GPU %.0f us, reserve %.0f us, alloc %.0f us per graph\n",
+                    (long long) n, tw/16, tr/16, ta/16);
+                tw = tr = ta = 0.0;
+            }
         }
     }
 
@@ -2095,6 +2128,114 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
     return t->buffer != NULL &&
         ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
         ggml_backend_buffer_is_host(t->buffer);
+}
+
+// local: the user inputs of a split (positions, masks, row ids, ...) are uploaded on the split backend's own stream from pinned
+// staging memory instead of one synchronous copy each. On HIP every synchronous copy is a host round trip of 40-120 us even for
+// a few bytes, and a speculative decoding step uploads about 30 small inputs while the GPU waits. Stream order replaces the
+// wait for the previous graph (the upload runs after everything queued before it); the staging memory has two generations per
+// backend (one per graph compute, alternating), and a generation is refilled only after the event recorded after its last
+// upload. Only for ROCm devices, where it was validated; GGML_SCHED_ASYNC_INPUTS=0 disables it (2 = any GPU backend with
+// asynchronous uploads, untested). Returns false when the input takes the synchronous path: no asynchronous upload or no
+// events on that backend, input not in contiguous host memory, larger than the staging cap, or no room left in the generation.
+static bool ggml_backend_sched_copy_input_async(ggml_backend_sched_t sched, const int b, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
+    ggml_backend_t backend = sched->backends[b];
+    if (sched->in_async_ok[b] == 0) {
+        static const int mode = []() { const char * e = getenv("GGML_SCHED_ASYNC_INPUTS"); return e ? atoi(e) : 1; }();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        bool ok = mode != 0 && dev != NULL && backend->iface.set_tensor_async != NULL &&
+            ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_host_buffer_type(dev) != NULL &&
+            (mode == 2 || strncmp(ggml_backend_dev_name(dev), "ROCm", 4) == 0);
+        for (int g = 0; g < 2 && ok; g++) {
+            sched->in_stage_ev[b][g] = ggml_backend_event_new(dev);
+            ok = sched->in_stage_ev[b][g] != NULL;
+        }
+        sched->in_async_ok[b] = ok ? 1 : -1;
+        // GGML_SCHED_ASYNC_INPUTS=3: one asynchronous copy per input even where the backend has the batched upload
+        ggml_backend_reg_t reg = ok && mode != 3 ? ggml_backend_dev_backend_reg(dev) : NULL;
+        sched->in_upload_fn[b] = reg ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_ink2_upload_n") : NULL;
+    }
+    if (sched->in_async_ok[b] < 0) {
+        return false;
+    }
+
+    const size_t cap    = (size_t) 8 << 20; // staging bytes per generation and backend (larger inputs: bandwidth-bound anyway)
+    const size_t align  = 256;
+    const size_t nbytes = ggml_nbytes(input);
+    ggml_backend_buffer_t dst_buf = input_cpy->view_src ? input_cpy->view_src->buffer : input_cpy->buffer;
+    if (nbytes == 0 || nbytes > cap/2 || input->data == NULL || input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer) ||
+        !ggml_is_contiguous(input) || dst_buf == NULL || dst_buf->buft != ggml_backend_get_default_buffer_type(backend)) {
+        return false;
+    }
+
+    if (!sched->in_stage_open[b]) {
+        // a new generation: its staging memory was last filled two graph computes ago, wait for those uploads
+        sched->in_stage_open[b] = true;
+        const int g = sched->in_stage_gen[b] ^= 1;
+        if (sched->in_stage_rec[b][g]) {
+            ggml_backend_event_synchronize(sched->in_stage_ev[b][g]);
+        }
+        const size_t want = std::min(cap, std::max((size_t) 1 << 20, sched->in_stage_need[b]));
+        if (sched->in_stage[b][g] == NULL || ggml_backend_buffer_get_size(sched->in_stage[b][g]) < want) {
+            ggml_backend_buffer_free(sched->in_stage[b][g]);
+            sched->in_stage[b][g] = ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend)), want);
+        }
+        sched->in_stage_off[b] = 0;
+    }
+    const int g = sched->in_stage_gen[b];
+    const size_t off = sched->in_stage_off[b];
+    sched->in_stage_off [b] = off + GGML_PAD(nbytes, align);
+    sched->in_stage_need[b] = std::max(sched->in_stage_need[b], sched->in_stage_off[b]);
+    if (sched->in_stage[b][g] == NULL || off + nbytes > ggml_backend_buffer_get_size(sched->in_stage[b][g])) {
+        return false; // no room in this generation: synchronous copy, the next generations get a larger buffer
+    }
+
+    char * stage = (char *) ggml_backend_buffer_get_base(sched->in_stage[b][g]) + off;
+    memcpy(stage, input->data, nbytes);
+    sched->in_stage_used[b] = true;
+    const int p = sched->in_pend_n[b];
+    if (sched->in_upload_fn[b] != NULL && p < 64 && input_cpy->data != NULL) {
+        sched->in_pend_off [b][p] = off;
+        sched->in_pend_dst [b][p] = input_cpy;
+        sched->in_pend_size[b][p] = nbytes;
+        sched->in_pend_n[b] = p + 1;
+        return true;
+    }
+    ggml_backend_tensor_set_async(backend, input_cpy, stage, 0, nbytes);
+    return true;
+}
+
+// local: uploads the inputs queued by ggml_backend_sched_copy_input_async for backend b with one backend call (the descriptors
+// go to the staging memory too); without room or when the call fails, one asynchronous copy per input from the staging memory
+static void ggml_backend_sched_flush_uploads(ggml_backend_sched_t sched, const int b) {
+    const int n = sched->in_pend_n[b];
+    if (n == 0) {
+        return;
+    }
+    sched->in_pend_n[b] = 0;
+    // same layout as ggml_cuda_ink2_upload_desc in ggml-cuda.cu
+    struct desc_t { uint64_t src_off; uint64_t dst; uint64_t size; };
+    ggml_backend_t        backend = sched->backends[b];
+    ggml_backend_buffer_t stage   = sched->in_stage[b][sched->in_stage_gen[b]];
+    char *                base    = (char *) ggml_backend_buffer_get_base(stage);
+    const size_t off  = GGML_PAD(sched->in_stage_off[b], 64);
+    const size_t need = (size_t) n*sizeof(desc_t);
+    sched->in_stage_off [b] = off + need;
+    sched->in_stage_need[b] = std::max(sched->in_stage_need[b], sched->in_stage_off[b]);
+    bool ok = off + need <= ggml_backend_buffer_get_size(stage);
+    if (ok) {
+        desc_t * d = (desc_t *) (base + off);
+        for (int i = 0; i < n; i++) {
+            d[i] = { (uint64_t) sched->in_pend_off[b][i], (uint64_t) (uintptr_t) sched->in_pend_dst[b][i]->data, (uint64_t) sched->in_pend_size[b][i] };
+        }
+        typedef bool (*upload_n_t)(ggml_backend_t, const void *, const void *, int);
+        ok = ((upload_n_t) sched->in_upload_fn[b])(backend, base, d, n);
+    }
+    if (!ok) {
+        for (int i = 0; i < n; i++) {
+            ggml_backend_tensor_set_async(backend, sched->in_pend_dst[b][i], base + sched->in_pend_off[b][i], 0, sched->in_pend_size[b][i]);
+        }
+    }
 }
 
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
@@ -2114,6 +2255,10 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        // local: staged asynchronous upload (the user may overwrite the input once this returns: it is copied to the staging first)
+        if (ggml_backend_sched_copy_input_async(sched, split_backend_id, input, input_cpy)) {
+            return;
+        }
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2122,6 +2267,18 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         }
         ggml_backend_tensor_copy(input, input_cpy);
         return;
+    }
+
+    // local: a result of a CPU split in host memory (e.g. the token embeddings: the input layer stays on the CPU) is uploaded
+    // the same way: the CPU backend computes synchronously, its data is complete once it is synchronized, and the staged
+    // upload on the split stream runs after everything that still reads the destination
+    if (input_backend != NULL && !ggml_backend_sched_is_host_weight(input) && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+            ggml_backend_get_device(input_backend) != NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_backend_synchronize(input_backend);
+        if (ggml_backend_sched_copy_input_async(sched, split_backend_id, input, input_cpy)) {
+            return;
+        }
     }
 
     // wait for the split backend to finish using the input before overwriting it
@@ -2216,6 +2373,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // local: every graph compute opens a new staging generation for the asynchronous input uploads
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->in_stage_open[b] = false;
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2223,7 +2385,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        // local: not for a CPU split after a GPU split that takes the staged uploads (ggml_backend_sched_copy_input_async):
+        // that GPU split never reads host compute memory asynchronously (its host inputs were copied to the staging memory
+        // before it was queued), and the CPU split writes host compute memory only (e.g. the token embeddings of a drafter
+        // whose input layer stays on the CPU, between two GPU splits: the wait cost a GPU round trip per draft).
+        // GGML_SCHED_CPU_SPLIT_WAIT=1 restores the wait.
+        static const bool cpu_split_wait = []() { const char * e = getenv("GGML_SCHED_CPU_SPLIT_WAIT"); return e && atoi(e) != 0; }();
+        const bool skip_wait = !cpu_split_wait && split->n_inputs == 0 && prev_backend_id >= 0 && sched->in_async_ok[prev_backend_id] > 0 &&
+            ggml_backend_get_device(split_backend) != NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id && !skip_wait) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -2238,6 +2409,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (!ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
                 ggml_backend_sched_copy_input(sched, split, input);
             }
+        }
+        // local: the staging generation of the uploads above is free again once this event has passed
+        ggml_backend_sched_flush_uploads(sched, split_backend_id);
+        if (sched->in_stage_used[split_backend_id]) {
+            const int g = sched->in_stage_gen[split_backend_id];
+            ggml_backend_event_record(sched->in_stage_ev[split_backend_id][g], split_backend);
+            sched->in_stage_rec [split_backend_id][g] = true;
+            sched->in_stage_used[split_backend_id]    = false;
         }
         // after the copies above, which may read host memory reused by the copies of the next split
         // before the weights, whose copy callback may queue large uploads
@@ -2381,6 +2560,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
         ggml_backend_event_free(sched->prefetch_events[b]);
+        for (int g = 0; g < 2; g++) {
+            if (sched->in_stage_rec[b][g]) {
+                ggml_backend_event_synchronize(sched->in_stage_ev[b][g]);
+            }
+            ggml_backend_event_free(sched->in_stage_ev[b][g]);
+            ggml_backend_buffer_free(sched->in_stage[b][g]);
+        }
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -2455,10 +2641,27 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
+    // local: GGML_SCHED_TIME=1 times the split (with the backends' graph_optimize) and the allocation of big graphs
+    static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
+    const int64_t t0 = sched_time ? ggml_time_us() : 0;
+
     ggml_backend_sched_split_graph(sched, graph);
+
+    const int64_t t1 = sched_time ? ggml_time_us() : 0;
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+
+    if (sched_time && graph->n_nodes >= 5000) {
+        static int64_t n = 0;
+        static double  ts = 0.0, ta = 0.0;
+        ts += (double) (t1 - t0);
+        ta += (double) (ggml_time_us() - t1);
+        if (++n % 16 == 0) {
+            fprintf(stderr, "sched time: %lld big graphs, split %.0f us, alloc %.0f us per graph\n", (long long) n, ts/16, ta/16);
+            ts = ta = 0.0;
+        }
     }
 
     sched->is_alloc = true;
