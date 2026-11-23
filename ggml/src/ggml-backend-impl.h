@@ -43,6 +43,11 @@ extern "C" {
     // i.e. the backend buffer type's get_alloc_size may return more than ggml_nbytes for the output tensor
     GGML_API bool ggml_op_alloc_size_may_expand(enum ggml_op op);
 
+    // local diagnostic, GGML_INK2_VIDMEM=1 (Windows): prints the video memory of this process (dedicated and shared, with the
+    // budgets the OS grants it) at every device allocation of at least 1 MiB and whenever the usage moved by 2 MiB or more since
+    // the last line. `what` names the event, `bytes` its size (0 for a plain check). No effect when the variable is not set.
+    GGML_API void ggml_backend_ink2_vidmem_log(const char * what, size_t bytes);
+
     //
     // Backend buffer
     //
