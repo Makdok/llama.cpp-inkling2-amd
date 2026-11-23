@@ -3,9 +3,19 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
+
+// local (Inkling 2 with separate KV streams, several slots): a ubatch of several sequences holds at most this many tokens per
+// sequence (decode and verify steps; a prompt goes alone), and the compute buffer is reserved for one sequence of n_ubatch
+// tokens (the far attention path) plus such ubatches. INKLING2_MULTI_RESERVE=0 (returns 0) restores the equal split and the
+// reserve of n_seq_max sequences of n_ubatch / n_seq_max tokens (the dense path).
+inline uint32_t llama_inkling2_multi_seq_tokens() {
+    static const uint32_t n = []() { const char * e = std::getenv("INKLING2_MULTI_RESERVE"); return e && e[0] == '0' ? 0u : 8u; }();
+    return n;
+}
 
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
@@ -75,4 +85,9 @@ struct llama_cparams {
 
     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
     llama_context * ctx_state_src;
+
+    // local (Inkling 2 DSpark drafter, llama_context::dspark_head_precompute): the target's output matrix times
+    // dspark_hidden_out (Q8_0 [rank, n_vocab]) and times dspark_hidden_out_b (F32 [n_vocab]), computed once at init
+    ggml_tensor * dspark_head_c  = nullptr;
+    ggml_tensor * dspark_head_cb = nullptr;
 };

@@ -60,6 +60,10 @@ struct llama_context {
 
     void synchronize();
 
+    // local: synchronize() unless the context was already synchronized since the outputs of the last decode were reserved
+    // (the sampling getters: one wait per decode instead of one per call)
+    void synchronize_sampled();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -268,6 +272,9 @@ private:
 
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
+    // local: precompute the DSpark head products of the target's output matrix (cparams.dspark_head_c / _cb)
+    void dspark_head_precompute();
+
     //
     // graph
     //
@@ -409,6 +416,9 @@ private:
 
     bool sched_need_reserve = true;
 
+    // local: set by synchronize(), cleared by output_reserve() (see synchronize_sampled)
+    bool outputs_synced = false;
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
@@ -475,6 +485,10 @@ private:
     ggml_backend_event_ptr ev_layer_inp_read;
     bool ev_layer_inp_read_recorded = false;
 
+    // local: a device-side wait to issue right before the next graph compute (INKLING2_INJECT_DEVWAIT)
+    ggml_backend_event_t pending_wait_ev      = nullptr;
+    ggml_backend_t       pending_wait_backend = nullptr;
+
     // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
     // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
     // ordered with the reader context like the layer input buffer
@@ -487,6 +501,10 @@ private:
     ggml_backend_event_ptr  ev_h_nextn_read;
     bool ev_h_nextn_written_recorded = false;
     bool ev_h_nextn_read_recorded    = false;
+
+    // local: buffer of the precomputed DSpark head products (cparams.dspark_head_c / _cb)
+    ggml_context_ptr        ctx_dspark_head;
+    ggml_backend_buffer_ptr buf_dspark_head;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
