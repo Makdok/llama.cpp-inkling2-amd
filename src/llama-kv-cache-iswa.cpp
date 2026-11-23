@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 
 //
 // llama_kv_cache_iswa
@@ -66,7 +67,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return  model.hparams.is_swa(il);
     };
 
-    const uint32_t size_base = kv_size;
+    uint32_t size_base = kv_size;
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
@@ -78,6 +79,23 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 __func__, "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
 
         size_swa = size_base;
+    }
+
+    // local: INKLING2_DRAFT_KV_WINDOW=n (block drafters, LLM_ARCH_DFLASH, e.g. DSpark): the full-attention layers of the
+    // drafter keep a ring of the last n positions (standard sliding-window rule, window n) instead of the whole context,
+    // when the context is longer than the ring. The target verifies every drafted token, so this can only change the
+    // acceptance of the drafts, never the output. Unset or 0: the full-length cache.
+    static const uint32_t draft_window = []() { const char * e = getenv("INKLING2_DRAFT_KV_WINDOW"); return e ? (uint32_t) std::max(0, atoi(e)) : 0u; }();
+    uint32_t       n_swa_base    = 0;
+    llama_swa_type swa_type_base = LLAMA_SWA_TYPE_NONE;
+    if (model.arch == LLM_ARCH_DFLASH && draft_window > 0 && !swa_full) {
+        const uint32_t size_win = GGML_PAD(draft_window*(unified ? n_seq_max : 1) + n_ubatch, 256);
+        if (size_win < size_base) {
+            size_base     = size_win;
+            n_swa_base    = draft_window;
+            swa_type_base = LLAMA_SWA_TYPE_STANDARD;
+            LLAMA_LOG_INFO("%s: draft model: non-SWA layers keep a window of %u positions\n", __func__, draft_window);
+        }
     }
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
@@ -95,12 +113,19 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            n_swa_base, swa_type_base, mem_other_base, filter_base, reuse, share);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
+    // local: with a quantized cache the sliding-window cache (small, fixed size) keeps F16: the fast prefill kernel reads it
+    // in place as a rotated ring, a quantized one would be copied to F16 at every call. INKLING2_SWA_KV_F16=0 gives it the
+    // requested types.
+    static const bool swa_kv_f16 = []() { const char * e = getenv("INKLING2_SWA_KV_F16"); return !(e && e[0] == '0'); }();
+    const ggml_type type_k_swa = swa_kv_f16 && ggml_is_quantized(type_k) ? GGML_TYPE_F16 : type_k;
+    const ggml_type type_v_swa = swa_kv_f16 && ggml_is_quantized(type_v) ? GGML_TYPE_F16 : type_v;
+
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams, type_k, type_v,
+            model, no_alloc, hparams, type_k_swa, type_v_swa,
             v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
 }
@@ -202,9 +227,12 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
     do {
         balloc.split_reset();
 
+        // local: one token per sequence in a drafter cache that allows it: one ubatch for all (see split_equal_single_rows)
+        const bool seq_split = embd_all && !(kv_base->split_equal_single_rows() && balloc.one_token_per_seq_set());
+
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = seq_split ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;

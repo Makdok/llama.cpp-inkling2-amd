@@ -70,6 +70,21 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+// local (Inkling): the ubatch part of llm_graph_input_mem_hybrid_iswa_rel::kq_dev: causal, one sequence and 1D positions
+// spanning at most 2048, so that the relative positions are exact in F16
+static bool inkling_kq_dev_ubatch(const llama_ubatch & ubatch, const llama_cparams & cparams) {
+    if (!cparams.causal_attn || ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 || ubatch.is_pos_2d()) {
+        return false;
+    }
+    llama_pos p_min = ubatch.pos[0];
+    llama_pos p_max = ubatch.pos[0];
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch.pos[i]);
+        p_max = std::max(p_max, ubatch.pos[i]);
+    }
+    return p_max - p_min < 2048;
+}
+
 static bool can_reuse_attn_mask(
         const llm_attn_mask & attn_mask,
         const llama_kv_cache_context * mctx,
@@ -1465,9 +1480,16 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
     }
 
+    // local diagnostic: INKLING2_MASK_TIME=1 prints the average host time of the two mask fills every 16 large ubatches
+    static const bool mask_time = std::getenv("INKLING2_MASK_TIME") != nullptr;
+    static int64_t mt_n = 0, mt_base = 0, mt_swa = 0;
+    const int64_t mt0 = mask_time ? ggml_time_us() : 0;
+
     if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
         attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
+
+    const int64_t mt1 = mask_time ? ggml_time_us() : 0;
 
     if (self_rel_pos->buffer) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
@@ -1479,12 +1501,58 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_v_idxs(inp_attn->self_v_idxs_swa, ubatch);
     }
 
+    const int64_t mt2 = mask_time ? ggml_time_us() : 0;
+
     if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
+    if (mask_time && ubatch->n_tokens >= 256) {
+        mt_base += mt1 - mt0;
+        mt_swa  += ggml_time_us() - mt2;
+        if (++mt_n == 16) {
+            fprintf(stderr, "%s: mask fill, 16 ubatches of %u (n_kv %lld): base %lld us, swa %lld us each\n", __func__,
+                    ubatch->n_tokens, (long long) (inp_attn->self_attn_mask.raw ? inp_attn->self_attn_mask.raw->ne[0] : 0),
+                    (long long) (mt_base/16), (long long) (mt_swa/16));
+            mt_n = mt_base = mt_swa = 0;
+        }
+    }
+
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    // local: inputs of the device-built KQ masks, see kq_dev
+    {
+        llama_pos p_min = ubatch->pos[0];
+        llama_pos p_max = ubatch->pos[0];
+        for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
+            p_min = std::min(p_min, ubatch->pos[i]);
+            p_max = std::max(p_max, ubatch->pos[i]);
+        }
+        const int32_t span = p_max - p_min + 1;
+        const int32_t lo_swa = -(int32_t) kq_n_swa - 1;
+        if (kq_k_neg[0]->buffer) {
+            attn_ctx->get_base()->set_input_kq_rel_pos(kq_k_neg[0], ubatch, -1, span, -1.0f);
+        }
+        if (kq_k_neg[1]->buffer) {
+            attn_ctx->get_swa()->set_input_kq_rel_pos(kq_k_neg[1], ubatch, lo_swa, span, -1.0f);
+        }
+        if (kq_k_pos->buffer) {
+            attn_ctx->get_swa()->set_input_kq_rel_pos(kq_k_pos, ubatch, lo_swa, span, 1.0f);
+        }
+        for (ggml_tensor * t : { kq_q_neg1, kq_q_swa }) {
+            if (!t->buffer) {
+                continue;
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+            ggml_fp16_t * data = (ggml_fp16_t *) t->data;
+            const float off = t == kq_q_neg1 ? 1.0f : -(float) kq_n_swa;
+            const float sgn = t == kq_q_neg1 ? -1.0f : 1.0f;
+            for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+                data[i] = ggml_fp32_to_fp16(sgn*((float) (ubatch->pos[i] - p_min) + off));
+            }
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1532,8 +1600,19 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     if (banded) {
-        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
-        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        // local: the SWA ring may also be rotated (allow_rot), with the same rotation
+        uint32_t rot[2] = { 0, 0 };
+        res &= attn_ctx->get_base()->get_n_kv_banded(rot[0], false)     == n_kv_banded[0];
+        res &= attn_ctx->get_swa()->get_n_kv_banded(rot[1], allow_rot)  == n_kv_banded[1];
+        res &= rot[0] == kv_rot[0] && rot[1] == kv_rot[1];
+    }
+
+    // local: the device-built masks depend on the ubatch (one sequence, span), see kq_dev
+    {
+        const bool ub_ok = inkling_kq_dev_ubatch(params.ubatch, params.cparams);
+        res &= kq_dev[0] == (kq_dev_model[0] && ub_ok);
+        res &= kq_dev[1] == (kq_dev_model[1] && ub_ok);
+        res &= kq_q_neg1->ne[1] == params.ubatch.n_tokens;
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
@@ -4393,10 +4472,16 @@ void llm_graph_context::build_conv_state_store(
 
     // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
     // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
-    ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
-    s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
-    s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
-    cb(s_slot_rev, "s_slot_rev", -1);
+    // local: one slot order per graph (it was rebuilt by every convolution: 3 launches each); the scheduler copies it to
+    // another device if a layer lives there
+    ggml_tensor *& s_slot_rev = inp->s_slot_rev;
+    if (!s_slot_rev) {
+        s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
+        s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
+        s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
+        cb(s_slot_rev, "s_slot_rev", -1);
+        ggml_build_forward_expand(gf, s_slot_rev);
+    }
 
     ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
 
@@ -4555,6 +4640,30 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+
+    // local: inputs of the device-built KQ masks (allocated only when the graph uses them), see kq_dev
+    static const bool kq_dev_env = []() { const char * e = std::getenv("INKLING2_MASK_DEV"); return !(e && e[0] == '0'); }();
+    inp->kq_n_swa        = hparams.n_swa;
+    inp->kq_dev_model[0] = kq_dev_env && cparams.flash_attn && !hparams.use_alibi;
+    inp->kq_dev_model[1] = inp->kq_dev_model[0] && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD && hparams.n_swa < 2048;
+    {
+        const bool ub_ok = inkling_kq_dev_ubatch(ubatch, cparams);
+        inp->kq_dev[0] = inp->kq_dev_model[0] && ub_ok;
+        inp->kq_dev[1] = inp->kq_dev_model[1] && ub_ok;
+    }
+    inp->kq_k_neg[0] = ggml_new_tensor_1d(ctx0, GGML_TYPE_F16, attn_ctx->get_base()->get_n_kv());
+    inp->kq_k_neg[1] = ggml_new_tensor_1d(ctx0, GGML_TYPE_F16, attn_ctx->get_swa()->get_n_kv());
+    inp->kq_k_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F16, attn_ctx->get_swa()->get_n_kv());
+    inp->kq_q_neg1   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, 1, ubatch.n_tokens);
+    inp->kq_q_swa    = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, 1, ubatch.n_tokens);
+    for (ggml_tensor * t : { inp->kq_k_neg[0], inp->kq_k_neg[1], inp->kq_k_pos, inp->kq_q_neg1, inp->kq_q_swa }) {
+        ggml_set_input(t);
+    }
+    ggml_set_name(inp->kq_k_neg[0], "attn_inp_kq_k_neg");
+    ggml_set_name(inp->kq_k_neg[1], "attn_inp_kq_k_neg_swa");
+    ggml_set_name(inp->kq_k_pos,    "attn_inp_kq_k_pos_swa");
+    ggml_set_name(inp->kq_q_neg1,   "attn_inp_kq_q_neg1");
+    ggml_set_name(inp->kq_q_swa,    "attn_inp_kq_q_swa");
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
