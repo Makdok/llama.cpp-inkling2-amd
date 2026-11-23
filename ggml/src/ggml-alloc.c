@@ -418,6 +418,29 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
+// local: extra bytes given to the last chunk of a device compute buffer when it is (re)allocated. The size a graph needs
+// varies a little from one reservation to the next (the backend sampler of a request, the rows read by a speculative
+// drafter, ...), and every growth after load frees and reallocates the WHOLE buffer: some runtimes (ROCm on Windows) keep
+// the freed block, so the process grows by the full new size, and on a card near its memory budget the new buffer lands
+// in shared system memory, where every later prompt reads ~10x slower. The headroom absorbs these small growths:
+// 64 MiB for a buffer of 160 MiB or more (the backend sampler alone adds ~36 MiB), size/4 (at least 4 MiB) for a smaller
+// one; GGML_ALLOC_HEADROOM_MIB=n sets it (0 = none, the upstream behaviour).
+static size_t ggml_vbuffer_headroom(ggml_backend_buffer_type_t buft, size_t size, size_t max_chunk) {
+    static long long mib = -2;
+    if (mib == -2) {
+        const char * e = getenv("GGML_ALLOC_HEADROOM_MIB");
+        mib = e ? atoll(e) : -1;
+    }
+    if (mib == 0 || size == 0 || ggml_backend_buft_is_host(buft)) {
+        return 0;
+    }
+    size_t h = mib > 0 ? (size_t) mib << 20 : (size >= ((size_t) 160 << 20) ? (size_t) 64 << 20 : MAX(size/4, (size_t) 4 << 20));
+    if (size + h > max_chunk) {
+        h = max_chunk > size ? max_chunk - size : 0;
+    }
+    return GGML_PAD(h, 4096);
+}
+
 static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
@@ -426,6 +449,9 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        if (n == talloc->n_chunks - 1 && usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            chunk_size += ggml_vbuffer_headroom(buft, chunk_size, talloc->max_chunk_size);
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -929,10 +955,52 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            // local diagnostic: GGML_ALLOC_TOP=<MiB> lists the graph nodes of at least that size when a buffer is (re)allocated
+            {
+                static int top_mib = -1;
+                if (top_mib < 0) {
+                    const char * e = getenv("GGML_ALLOC_TOP");
+                    top_mib = e ? atoi(e) : 0;
+                }
+                if (top_mib > 0) {
+                    fprintf(stderr, "alloc top: %s buffer -> %.2f MiB, graph of %d nodes:\n", ggml_backend_buft_name(galloc->bufts[i]),
+                        new_size / 1024.0 / 1024.0, graph->n_nodes);
+                    for (int n = 0; n < graph->n_nodes; n++) {
+                        const struct ggml_tensor * t = graph->nodes[n];
+                        if (ggml_nbytes(t) >= (size_t) top_mib << 20 && t->view_src == NULL) {
+                            fprintf(stderr, "  %8.2f MiB  %-12s %s [%lld, %lld, %lld, %lld]\n", ggml_nbytes(t) / 1024.0 / 1024.0,
+                                ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+                        }
+                    }
+                }
+            }
+            // local diagnostic: GGML_ALLOC_GROWTH=1 prints every growth of an already allocated compute buffer
+            {
+                static int growth_log = -1;
+                if (growth_log < 0) {
+                    growth_log = getenv("GGML_ALLOC_GROWTH") != NULL;
+                }
+                const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                if (growth_log && cur_size > 0) {
+                    fprintf(stderr, "alloc growth: %s buffer %.2f -> %.2f MiB (graph of %d nodes)\n",
+                        ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0, graph->n_nodes);
+                }
+                // local: a device compute buffer that outgrows its headroom (see ggml_vbuffer_headroom) is said once per growth
+                if (!growth_log && cur_size > 0 && !no_alloc && !ggml_backend_buft_is_host(galloc->bufts[i])) {
+                    GGML_LOG_WARN("%s: %s compute buffer grows from %.2f to %.2f MiB after its first allocation; near the memory "
+                        "limit the new buffer can land in shared memory (GGML_ALLOC_HEADROOM_MIB sets the margin)\n", __func__,
+                        ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+                }
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
+                {
+                    char what[64];
+                    snprintf(what, sizeof(what), "compute buffer %.16s, %d nodes", ggml_backend_buft_name(galloc->bufts[i]), graph->n_nodes);
+                    ggml_backend_ink2_vidmem_log(what, new_size);
+                }
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
