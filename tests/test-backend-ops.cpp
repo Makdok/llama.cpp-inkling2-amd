@@ -9422,6 +9422,165 @@ struct test_flash_attn_ext_banded_sinks : public test_flash_attn_ext_banded {
     }
 };
 
+// local: far mode (ggml_flash_attn_ext_banded_set_far): last rel row for every larger distance, zero-logit sink,
+// n_kv_pad invisible padding cells at the end of K/V that Q is not aligned to
+struct test_flash_attn_ext_banded_far : public test_flash_attn_ext_banded {
+    const int64_t n_kv_pad;
+    const int64_t rot; // local: rotated ring of K/V cells (a wrapped SWA cache), cell k = logical key (k - rot) mod n_kv
+
+    std::string vars() override {
+        return test_flash_attn_ext_banded::vars() + ",far_pad=" + std::to_string(n_kv_pad) + (rot ? ",rot=" + std::to_string(rot) : "");
+    }
+
+    test_flash_attn_ext_banded_far(int64_t d, int64_t n_head, int64_t n_head_kv, int64_t n_q, int64_t n_kv, int64_t rel_extent,
+            int mask_kind, ggml_type kv_type, int64_t n_kv_pad, int64_t rot = 0)
+        : test_flash_attn_ext_banded(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, GGML_TYPE_F32), n_kv_pad(n_kv_pad), rot(rot) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext_banded::build_graph(ctx);
+        ggml_flash_attn_ext_banded_set_far_rot(out, n_kv_pad, rot);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext_banded::initialize_tensors(ctx);
+        std::vector<ggml_fp16_t> data(n_q*n_kv);
+        for (int64_t iq = 0; iq < n_q; ++iq) {
+            for (int64_t ik = 0; ik < n_kv; ++ik) {
+                const int64_t ik_log   = ik - rot + (ik < rot ? n_kv : 0);
+                const int64_t rel_dist = iq + (n_kv - n_kv_pad - n_q) - ik_log;
+                // mask_kind 2: sliding window of rel_extent - 1 cells, as in the SWA layers
+                const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent - 1);
+                data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+            }
+        }
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(data[0]));
+    }
+};
+
+// local: the small-op patterns of the Inkling 2 graph that the CUDA/HIP backend fuses (inkling2-fused.cu), built exactly
+// as src/models/inkling2.cpp builds them, so that the fused kernels are compared with the CPU ops
+struct test_ink2_clip : public test_case {
+    const int64_t d, n_head, n_tokens;
+    const bool    with_scale;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "INK2_CLIP"; }
+    std::string vars() override { return VARS_TO_STR4(d, n_head, n_tokens, with_scale); }
+
+    test_ink2_clip(int64_t d, int64_t n_head, int64_t n_tokens, bool with_scale)
+        : d(d), n_head(n_head), n_tokens(n_tokens), with_scale(with_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, n_tokens);
+        ggml_set_name(cur, "cur");
+        if (with_scale) {
+            ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_head);
+            ggml_set_name(scale, "scale");
+            cur = ggml_mul(ctx, cur, scale);
+        } else {
+            cur = ggml_scale(ctx, cur, 1.5f); // an op output, as in the model
+        }
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, 2.0f), norm);
+        ggml_tensor * out = ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
+struct test_ink2_mix : public test_case {
+    const int64_t n_embd, n_blocks, n_q, n_tokens;
+    const bool    query_view;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "INK2_MIX"; }
+    std::string vars() override { return VARS_TO_STR5(n_embd, n_blocks, n_q, n_tokens, query_view); }
+    double max_nmse_err() override { return 1e-6; }
+
+    test_ink2_mix(int64_t n_embd, int64_t n_blocks, int64_t n_q, int64_t n_tokens, bool query_view)
+        : n_embd(n_embd), n_blocks(n_blocks), n_q(n_q), n_tokens(n_tokens), query_view(query_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        std::vector<ggml_tensor *> blocks;
+        for (int64_t i = 0; i < n_blocks; ++i) {
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            blocks.push_back(ggml_scale(ctx, b, 1.0f + 0.25f*i));
+        }
+        ggml_tensor * cur = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens), 0.75f);
+        ggml_tensor * query;
+        if (query_view) {
+            ggml_tensor * all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 3*n_q);
+            ggml_set_param(all); // a weight, as loop_res_query
+            query = ggml_view_2d(ctx, all, n_embd, n_q, all->nb[1], n_q*all->nb[1]);
+        } else {
+            query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_q);
+        }
+
+        ggml_tensor * states = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+        for (ggml_tensor * block : blocks) {
+            states = ggml_concat(ctx, ggml_reshape_3d(ctx, block, n_embd, 1, n_tokens), states, 1);
+        }
+        states = ggml_rms_norm(ctx, states, 1e-6f);
+        ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+        ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+        scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -4.0f, 4.0f);
+        }
+    }
+};
+
+struct test_ink2_gate : public test_case {
+    const int64_t n_embd, n_rank, n_tokens;
+    const ggml_type wtype; // weights: F32, or BF16 (the lossless storage of the Inkling 2 Mini loop gates)
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "INK2_GATE"; }
+    std::string vars() override { return VARS_TO_STR4(n_embd, n_rank, n_tokens, wtype); }
+    // BF16 weights: the products round their activations to BF16 on every backend, in another order
+    double max_nmse_err() override { return wtype == GGML_TYPE_F32 ? 1e-6 : 5e-5; }
+
+    test_ink2_gate(int64_t n_embd, int64_t n_rank, int64_t n_tokens, ggml_type wtype = GGML_TYPE_F32)
+        : n_embd(n_embd), n_rank(n_rank), n_tokens(n_tokens), wtype(wtype) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur     = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens), 0.75f);
+        ggml_tensor * message = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens), 1.25f);
+        ggml_tensor * down    = ggml_new_tensor_2d(ctx, wtype, 2*n_embd, n_rank);
+        ggml_tensor * gain    = ggml_new_tensor_2d(ctx, wtype, n_rank, n_embd);
+        ggml_tensor * forget  = ggml_new_tensor_2d(ctx, wtype, n_rank, n_embd);
+        ggml_set_name(down, "down"); ggml_set_name(gain, "gain"); ggml_set_name(forget, "forget");
+
+        ggml_tensor * h = ggml_concat(ctx, ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens), ggml_reshape_3d(ctx, message, n_embd, 1, n_tokens), 1);
+        h = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, h, 1e-6f), 2*n_embd, n_tokens);
+        h = ggml_mul_mat(ctx, down, h);
+        ggml_tensor * g = ggml_tanh(ctx, ggml_mul_mat(ctx, gain, h));
+        ggml_tensor * f = ggml_tanh(ctx, ggml_mul_mat(ctx, forget, h));
+        ggml_tensor * out = ggml_add(ctx, ggml_mul(ctx, ggml_scale_bias(ctx, f, -1.0f, 1.0f), cur), ggml_mul(ctx, g, message));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const bool weight = strcmp(t->name, "down") == 0 || strcmp(t->name, "gain") == 0 || strcmp(t->name, "forget") == 0;
+            init_tensor_uniform(t, weight ? -0.05f : -3.0f, weight ? 0.05f : 3.0f);
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13691,6 +13850,77 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1,   1, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+    // local: the FP16 expert kernel of prompt batches (RDNA3; NVFP4 from 32 tokens, Q8_0 / Q5_K from 256) for its three weight
+    // types, several Q5_K super-blocks per row, and the Inkling 2 Mini shapes (gate_up 2304 -> 2304, down 1152 -> 2304)
+    for (ggml_type t : { GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4 }) {
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 16, 4, false, 256, 40, 768));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 16, 4, false, 256, 300, 768));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, 256, 2304));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, 256, 1152));
+    // local: F32 products with an inner dimension of 16 / 17 (relative-bias table of the far attention), src0 broadcast over
+    // the batches of src1, and flat
+    for (int64_t k : { 16, 17 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24, k, {1, 1}, {64, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 1100, k, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 300, 24, k, {1, 1}, {50, 1}));
+    }
+    // local: fused Inkling 2 patterns
+    for (int64_t n_tokens : { 1, 3, 65 }) {
+        test_cases.emplace_back(new test_ink2_clip(128, 24, n_tokens, true));
+        test_cases.emplace_back(new test_ink2_clip(128,  8, n_tokens, false));
+        test_cases.emplace_back(new test_ink2_clip( 16, 24, n_tokens, true));
+        for (int64_t n_blocks : { 1, 2, 4, 5 }) {
+            test_cases.emplace_back(new test_ink2_mix(2304, n_blocks, 1, n_tokens, false));
+            test_cases.emplace_back(new test_ink2_mix(2304, n_blocks, 3, n_tokens, false));
+            test_cases.emplace_back(new test_ink2_mix(2304, n_blocks, 2, n_tokens, true));
+        }
+        test_cases.emplace_back(new test_ink2_gate(2304, 64, n_tokens));
+        test_cases.emplace_back(new test_ink2_gate( 768, 32, n_tokens));
+    }
+    // local: the loop gate of prompt batches with BF16 weights (more than 16 tokens: the three-kernel form on RDNA3), with
+    // partial token tiles
+    for (int64_t n_tokens : { 17, 64, 65, 200, 1024, 1000 }) {
+        test_cases.emplace_back(new test_ink2_gate(2304, 64, n_tokens, GGML_TYPE_BF16));
+    }
+    // local: dense Inkling 2 attention of decode and verify batches (per-head mask, 24 query heads over 8 K/V heads)
+    for (int64_t nb : { 1, 2, 4, 8 }) {
+        for (int64_t kv : { 1280, 4096 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 0, 0, 24));
+        }
+    }
+    // local: far mode with the Inkling 2 Mini shapes (24 heads over 8 K/V heads, extent 1024 + far row)
+    for (int64_t pad : { 0, 123 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8,  64,   512, 1025, 1, GGML_TYPE_F16, pad));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 512,  4096, 1025, 1, GGML_TYPE_F16, pad));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 512,  2048, 1025, 2, GGML_TYPE_F16, pad));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 500,  8192, 1025, 1, GGML_TYPE_F16, pad));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 512, 33792, 1025, 1, GGML_TYPE_F16, pad));
+        test_cases.emplace_back(new test_flash_attn_ext_banded_far(128,  8, 2, 512,  4096,   33, 1, GGML_TYPE_BF16, pad));
+    }
+    // local: a wrapped SWA ring (1536 cells = window 1024 + ubatch 512), rotated by whole ubatches or by an arbitrary offset
+    for (int64_t rot : { 512, 1024, 37, 1100 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 512, 1536, 1025, 2, GGML_TYPE_F16, 0, rot));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 100, 1536, 1025, 2, GGML_TYPE_F16, 0, 700));
+    // local: a rotated ring that is not full (empty cells = padding at the logical end, after a checkpoint restore)
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 512, 2048, 1025, 2, GGML_TYPE_F16, 2, 700));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 1022, 2048, 1025, 2, GGML_TYPE_F16, 2, 0));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 300, 2048, 1025, 2, GGML_TYPE_F16, 130, 1500));
+    // local: 1..8 query rows over a q8_0 cache, 24 query heads over 8 K/V heads, per-head and shared masks, with and without
+    // sinks (decode and the verify batches of speculative decoding at long context; RDNA3 runs 2..8 rows in a kernel shared by
+    // the 3 query heads of a K/V head)
+    for (int64_t nb : { 1, 2, 3, 4, 5, 8 }) {
+        for (int64_t mh : { 24, 1 }) {
+            for (bool sinks : { false, true }) {
+                for (int64_t kv : { 512, 4096 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32,
+                        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, 0, mh));
+                }
+            }
+        }
+    }
 
     // mask broadcast over Q heads and batches
     for (bool sinks : { false, true }) {
@@ -14082,6 +14312,94 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // local: lighter types for the Inkling 2 Q8_0 tensors: the attention shape (in the infinity cache) and a 120 MB
+    // matrix (DRAM regime), 1 and 4 columns
+    for (ggml_type t : { GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (int n : { 1, 4 }) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  3072, n, 2304, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 49152, n, 2304, {1, 1}, {1, 1}));
+        }
+    }
+    // local: the NVFP4 experts of a prompt batch (128 experts, 8 per token): gate_up (2304 -> 2304) and down (1152 -> 2304)
+    for (int64_t n : { 1, 2, 4, 256, 512, 1024, 2048 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
+    }
+    // local: the relative-bias table of a far attention call of a 1024-token batch: [17, 1025] x [17, 24 heads, 1024 tokens]
+    // with src0 broadcast over the tokens (the form the graph used to build) and as one flat GEMM (the graph now); the router
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24, 17, {1, 1}, {1024, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, 24576, 17, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1024, 2304, {1, 1}, {1, 1}));
+    // local: the dense products of a 1024-token prompt batch: Q8_0 attention projections (wq / gate, wk / wv, wo, r) and the
+    // BF16 loop controllers (down 4608 -> 64, gain / forget 64 -> 2304)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 3072, 1024, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1024, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2304, 1024, 3072, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  384, 1024, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,   64, 1024, 4608, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 2304, 1024,   64, {1, 1}, {1, 1}));
+    // local: a whole loop gate of a 1024-token prompt batch (BF16 weights, as in the model file)
+    test_cases.emplace_back(new test_ink2_gate(2304, 64, 1024, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_ink2_gate(2304, 64, 512, GGML_TYPE_BF16));
+    // local: the experts of the last 4 layers of the Unsloth Q4_K_M file (gate_up Q5_K, down Q8_0)
+    for (int64_t n : { 256, 1024 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
+    }
+    // local: far banded attention of a 1024-token prompt batch: global layer at 26k / 52k keys, SWA ring of 2048 cells
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 1024, 26624, 1025, 1, GGML_TYPE_F16, 0));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 1024, 52224, 1025, 1, GGML_TYPE_F16, 0));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 1024,  2048, 1025, 2, GGML_TYPE_F16, 0, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 1024,  2048, 1025, 2, GGML_TYPE_F16, 0, 0));
+    // local: the same for the 4-token verify batch of speculative decoding (compare with the dense 4-row cases below)
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 4, 52224, 1025, 1, GGML_TYPE_F16, 0));
+    test_cases.emplace_back(new test_flash_attn_ext_banded_far(128, 24, 8, 4,  2048, 1025, 2, GGML_TYPE_F16, 0, 1024));
+    // the output head shape (201024 x 2304): past the 96 MB infinity cache for every type
+    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K }) {
+        for (int n : { 1, 4 }) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 201024, n, 2304, {1, 1}, {1, 1}));
+        }
+    }
+    // local: the DSpark head precompute (dspark_head_precompute): W for the 3 drafted positions at once, then C = W*Hout
+    // (Q8_0 [256, 201024]) once per drafted position
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 201024, 3, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 201024, 3, 2304, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 201024, 1, 256, {1, 1}, {1, 1}));
+    // local: Inkling 2 Mini shapes of a decoded token (n = 1) and of the verify batches of the drafter (n = 2..8); the perf
+    // mode computes whole graphs, so the INK2_* cases run the fused kernels of the CUDA/HIP backend
+    for (int n : { 1, 2, 4, 8 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 3072, n, 2304, {1, 1}, {1, 1})); // wq, attention gate
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, n, 2304, {1, 1}, {1, 1})); // wk, wv
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2304, n, 3072, {1, 1}, {1, 1})); // wo
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  384, n, 2304, {1, 1}, {1, 1})); // relative r
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 49152, n, 2304, {1, 1}, {1, 1})); // 120 MB: past the infinity cache
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,   24, n, 2304, {1, 1}, {1, 1})); // sink projection
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,   32, n, 2304, {1, 1}, {1, 1})); // conv taps
+        test_cases.emplace_back(new test_ink2_gate(2304, 64, n));
+        test_cases.emplace_back(new test_ink2_mix(2304, 3, 3, n, false));
+        test_cases.emplace_back(new test_ink2_mix(2304, 3, 2, n, true));
+        // dense attention with the per-head relative-bias mask: 24 query heads over 8 K/V heads, K/V views of the cache
+        for (int64_t kv : { 1280, 16384, 51200 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, n, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 0, 0, 24));
+        }
+    }
+    // local: the verify batch of 4 tokens at a 128k context with the q8_0 cache (vector kernel) and F16, per-head mask (as
+    // decoded) and a mask shared by the heads (GQA sharing, the bound of a kernel that adds the bias per head itself)
+    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t mh : { 24, 1 }) {
+            for (int64_t kv : { 51200, 125952 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 4, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                    t, t, {0, 2, 1, 3}, true, false, 0, 0, mh));
+            }
+        }
+    }
+    // and one decoded token over the q8_0 cache
+    for (int64_t kv : { 51200, 125952 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, 0, 24));
+    }
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
