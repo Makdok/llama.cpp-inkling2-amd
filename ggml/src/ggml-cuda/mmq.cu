@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "inkling2-fused.cuh" // local: ggml_cuda_ink2_moe_f16
 
 #include <cstdint>
 
@@ -253,6 +254,14 @@ void ggml_cuda_mul_mat_q(
     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0->type, fusion ? fusion->prec_src1 : ggml_prec_get_src(dst, 1), cc);
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
+
+#if defined(GGML_USE_HIP)
+    // local (RDNA3): NVFP4 expert products of prompt batches on FP16 WMMA instead of int8 MMQ, see inkling2-fused.cu
+    if (ids && !gate && !use_native_fp4 && ggml_cuda_ink2_moe_f16(ctx, src0, src1, ids, dst, fusion ? fusion->x_scale : nullptr)) {
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
+
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
@@ -502,6 +511,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (amd_wmma_available(cc)) {
+        // local (measurement switch): GGML_CUDA_INK2_Q8_BLAS=n sends dense Q8_0 products of at least n columns to dequantize +
+        // hipBLAS instead of MMQ
+        static const int ink2_q8_blas = []() { const char * e = getenv("GGML_CUDA_INK2_Q8_BLAS"); return e ? atoi(e) : 0; }();
+        if (ink2_q8_blas > 0 && type == GGML_TYPE_Q8_0 && n_experts == 0 && ne11 >= ink2_q8_blas) {
+            return false;
+        }
         if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
             // High expert counts are almost always better on MMQ due to
             //     the synchronization overhead in the cuBLAS/hipBLAS path:

@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "inkling2-fused.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -32,6 +33,25 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
 #endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+// local: NVFP4 dot product of one 16-value sub-block (2 ints) per call, for the expert kernel of 2..8 tokens with 2 ints per
+// thread and step (see mul_mat_vec_q_moe); same per-sub-block arithmetic as vec_dot_nvfp4_q8_1, partial sums grouped differently
+static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_v2(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int32_t & kbx, const int32_t & iqs) {
+    const block_nvfp4 * bq4 = (const block_nvfp4 *) vbq + kbx;
+    const int32_t iqs0 = iqs;
+    const int32_t iqs1 = iqs0 + 1;
+    const int32_t is = iqs0 >> 1;
+    const int2 v0 = get_int_from_table_16(get_int_b4(bq4->qs, iqs0), kvalues_mxfp4);
+    const int2 v1 = get_int_from_table_16(get_int_b4(bq4->qs, iqs1), kvalues_mxfp4);
+    const block_q8_1 * bq8 = bq8_1 + (is >> 1);
+    const int32_t i8 = ((is & 1) << 2);
+    int sumi = ggml_cuda_dp4a(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
+    sumi = ggml_cuda_dp4a(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
+    sumi = ggml_cuda_dp4a(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
+    sumi = ggml_cuda_dp4a(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+    return ggml_cuda_ue4m3_to_fp32(bq4->d[is]) * __low2float(bq8->ds) * float(sumi);
+}
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
@@ -91,6 +111,14 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         default:                return 1;
     }
 }
+
+// Local tuning hooks (RDNA3 parameter table only): thread-block shape of the Q8_0 mat-vec kernel for a single output column.
+#ifndef INK2_Q8_NWARPS
+#define INK2_Q8_NWARPS 2
+#endif
+#ifndef INK2_Q8_RPB
+#define INK2_Q8_RPB 1
+#endif
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
@@ -544,8 +572,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
                     return 8;
+                case GGML_TYPE_Q8_0:
+                    return INK2_Q8_NWARPS;
                 case GGML_TYPE_Q6_K:
                     return 2;
                 case GGML_TYPE_IQ4_NL:
@@ -681,6 +710,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             default:
                 return 1;
         }
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_Q8_0 && ncols_dst == 1) {
+        return INK2_Q8_RPB;
     }
     return 1;
 }
@@ -944,7 +976,10 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+// c_slot_fast (local): grid (nchannels_dst, ceil(nrows_x / c_rows_per_block)) instead, so that the blocks running at the same
+// time cover every expert slot of the same rows: the tokens that picked the same expert read the same weight rows together,
+// served by the L2 cache, instead of one pass over the matrix per slot.
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool c_slot_fast = false, bool c_vdr2 = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
@@ -960,12 +995,16 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    // c_vdr2 (NVFP4): 2 ints (one sub-block) per thread and step, see vec_dot_nvfp4_q8_1_v2
+    constexpr int vdr = type == GGML_TYPE_NVFP4 && c_vdr2 ? 2 : get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = type == GGML_TYPE_NVFP4 && c_vdr2 ? vec_dot_nvfp4_q8_1_v2 : get_vec_dot_q_cuda(type);
 
-    const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    const uint32_t blk_slot = c_slot_fast ? blockIdx.x : blockIdx.y;
+    const uint32_t blk_row  = c_slot_fast ? blockIdx.y : blockIdx.x;
+    const uint32_t n_slot   = c_slot_fast ? gridDim.x  : gridDim.y;
+    const bool shared_expert = has_fusion && fusion.shared_up && blk_slot == n_slot - 1;
     if (shared_expert) {
         vx = fusion.shared_up;
         dst = fusion.shared_dst;
@@ -996,11 +1035,11 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     const uint32_t token_idx   = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      row0        = c_rows_per_block*blk_row;
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
+    const uint32_t channel_dst = shared_expert ? 0 : blk_slot;
 
     if (token_idx >= ncols_dst) {
         return;
@@ -1151,7 +1190,11 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+    // 2 gives best perf based on tuning (upstream). local: on RDNA3 (ggml_cuda_ink2_arch_ok) NVFP4 takes 4 rows (verify batch of
+    // 4 tokens: 76 -> 72 us per product, same arithmetic per row); GGML_CUDA_INK2_MOE_RPB = 1, 2, 4 or 8 sets the tile there
+    static const int rpb_env = []() { const char * e = getenv("GGML_CUDA_INK2_MOE_RPB"); return e ? atoi(e) : 4; }();
+    const bool rpb_local = type == GGML_TYPE_NVFP4 && ggml_cuda_ink2_arch_ok(ggml_cuda_get_device());
+    const int rows_per_block = rpb_local && (rpb_env == 1 || rpb_env == 4 || rpb_env == 8) ? rpb_env : 2;
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
     const dim3 block_dims(warp_size, ncols_dst);
@@ -1160,19 +1203,76 @@ static void mul_mat_vec_q_moe_launch(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
-    } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+    // local: NVFP4 on RDNA3 with 4 rows per block runs the slot-fast grid order (same arithmetic); GGML_CUDA_INK2_MOE_SLOTFAST=0
+    // keeps the row-fast order
+    static const bool slot_fast_env = []() { const char * e = getenv("GGML_CUDA_INK2_MOE_SLOTFAST"); return !(e && e[0] == '0'); }();
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        if (slot_fast_env && rpb_local && rows_per_block == 4 && nblocks_rows <= 65535) {
+            const dim3 block_nums_sf(nchannels_dst + (fusion.shared_up != nullptr), nblocks_rows);
+            const ggml_cuda_kernel_launch_params launch_params_sf = ggml_cuda_kernel_launch_params(block_nums_sf, block_dims, 0, stream);
+            // local: 2..8 tokens with 2 ints per thread and step (K = 2304 is 36 NVFP4 blocks: with 4 ints a warp covers 16
+            // blocks per step and its last step keeps 8 of 32 lanes busy; with 2 ints 8 blocks per step). Other summation order
+            // of the partial sums: decode-path perplexity 6.1857 vs 6.1776 with 4 ints, so off by default; GGML_CUDA_INK2_MOE_VDR2=1
+            // enables it (~-0.4 ms per verify batch of 4 tokens).
+            static const bool vdr2_env = []() { const char * e = getenv("GGML_CUDA_INK2_MOE_VDR2"); return e && atoi(e) != 0; }();
+            if (vdr2_env && ncols_dst >= 2) {
+                if (has_fusion) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 4, true, true, true>, launch_params_sf,
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                        stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        ncols_dst, ids_stride);
+                } else {
+                    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 4, false, true, true>, launch_params_sf,
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                        stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        ncols_dst, ids_stride);
+                }
+                return;
+            }
+            if (has_fusion) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 4, true, true>, launch_params_sf,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 4, false, true>, launch_params_sf,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride);
+            }
+            return;
+        }
     }
+
+    const auto launch = [&](auto rpb_c) {
+        constexpr int rpb = decltype(rpb_c)::value;
+        if (has_fusion) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rpb, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride);
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rpb, false>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride);
+        }
+    };
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        switch (rows_per_block) {
+            case 1:  launch(std::integral_constant<int, 1>{}); return;
+            case 4:  launch(std::integral_constant<int, 4>{}); return;
+            case 8:  launch(std::integral_constant<int, 8>{}); return;
+            default: break;
+        }
+    }
+    launch(std::integral_constant<int, 2>{});
 }
 
 template <ggml_type type>
@@ -1559,6 +1659,28 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    // TIMING EXPERIMENT ONLY (wrong output, builds with GGML_CUDA_INK2_COST_TOOLS): GGML_CUDA_INK2_SKIP_MMVQ=<type name> does not
+    // run the mat-vec products of that weight type (also the fused MoE ones, not the output head); the speed difference is
+    // what they really cost
+#if defined(GGML_CUDA_INK2_COST_TOOLS)
+    static const char * skip_type = getenv("GGML_CUDA_INK2_SKIP_MMVQ");
+#else
+    static const char * skip_type = nullptr;
+#endif
+
+    // local (RDNA3, see ggml_cuda_ink2_arch_ok): Q8_0 times a few F32 vectors without the q8_1 quantization of the vectors
+    // (one launch instead of two)
+    if (!ids && !fusion && ggml_cuda_ink2_arch_ok(ggml_cuda_get_device()) && ggml_cuda_ink2_mmv_q8_f32_supported(src0, src1, dst)) {
+        if (!(skip_type && strcmp(skip_type, "q8_0") == 0 && src0->ne[1] < 100000)) {
+            ggml_cuda_op_ink2_mmv_q8_f32(ctx, src0, src1, dst);
+        }
+        return;
+    }
+
+    if (skip_type && strcmp(skip_type, ggml_type_name(src0->type)) == 0 && src0->ne[1] < 100000) {
+        return;
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

@@ -13,6 +13,11 @@ struct topk_moe_config {
     bool delayed_softmax;
     int  n_groups;
     int  n_group_used;
+    // local: w / (sum(w) + norm_eps) * norm_scale of the selected weights, written to norm_dst (nullptr: not done); the same
+    // arithmetic as the separate weight-normalisation kernel of the Inkling 2 fusions (ggml_cuda_op_ink2_moe_wnorm)
+    float * norm_dst;
+    float   norm_eps;
+    float   norm_scale;
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -353,6 +358,99 @@ __global__ void topk_moe_cuda(const float *         logits,
             weights[idx] = output_weights[i] * scale_val;
         }
     }
+
+    // local: the normalisation of the selected weights (n_expert_used <= warp_size: lane k holds weight k), the order of
+    // ink2_moe_wnorm_f32: one value per lane, a warp sum, w * (scale / (sum + eps))
+    if (config.norm_dst) {
+        float v   = 0.0f;
+        float sum = 0.0f;
+        if ((int) threadIdx.x < n_expert_used) {
+            v    = output_weights[0] * scale_val;
+            sum += v;
+        }
+        sum = warp_reduce_sum(sum);
+        const float f = config.norm_scale/(sum + config.norm_eps);
+        if ((int) threadIdx.x < n_expert_used) {
+            config.norm_dst[(int64_t) row*n_expert_used + threadIdx.x] = v*f;
+        }
+    }
+}
+
+// local (RDNA3, Inkling 2: sigmoid scores, a selection bias, no groups): the selection of topk_moe_cuda by rank instead of
+// n_expert_used rounds of warp-wide argmax (one shuffle reduction of three values per round, in series). One thread per expert
+// (n_experts threads per row, TOPK_MOE_ROWS_PER_BLOCK rows per block as there): each ranks its expert against the whole row,
+// counting the experts with a larger selection value and those with an equal one and a lower index, which is the order in
+// which the rounds pick them; the experts of rank < n_expert_used are written at their rank. The scores, the NaN rule, the
+// weights (the unbiased scores times scale_val) and the normalisation (first warp of the row, one weight per lane) are those
+// of topk_moe_cuda: ids and weights are the same bit for bit. All rows of a block are read before any write (the outputs may
+// alias the logits within one block, as there).
+template <int n_experts>
+__launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * n_experts, 1)
+__global__ void ink2_topk_rank_cuda(const float * logits, float * weights, int32_t * ids, const float * bias, const int n_rows,
+                                    const int n_expert_used, const float scale_val, const topk_moe_config config) {
+    __shared__ float s_sel[TOPK_MOE_ROWS_PER_BLOCK][n_experts];
+    __shared__ float s_w[TOPK_MOE_ROWS_PER_BLOCK][32];
+
+    const int  e      = threadIdx.x;
+    const int  wy     = threadIdx.y;
+    const int  row    = blockIdx.x * blockDim.y + wy;
+    const bool active = row < n_rows;
+
+    float wt = 0.0f;
+    ggml_cuda_pdl_sync();
+    if (active) {
+        wt = logits[(int64_t) n_experts * row + e];
+    }
+    __syncthreads();
+
+    float sel = 0.0f;
+    if (active) {
+        wt = 1.f / (1.f + expf(-wt));
+        if (__isnanf(wt)) {
+            wt = -FLT_MAX;
+        }
+        sel = wt + bias[e];
+        if (__isnanf(sel)) {
+            sel = -FLT_MAX;
+        }
+        s_sel[wy][e] = sel;
+    }
+    __syncthreads();
+
+    ggml_cuda_pdl_lc();
+    if (active) {
+        int rank = 0;
+#pragma unroll 8
+        for (int j = 0; j < n_experts; j += 4) {
+            const float4 v = *(const float4 *) &s_sel[wy][j];
+            rank += (v.x > sel || (v.x == sel && j + 0 < e)) ? 1 : 0;
+            rank += (v.y > sel || (v.y == sel && j + 1 < e)) ? 1 : 0;
+            rank += (v.z > sel || (v.z == sel && j + 2 < e)) ? 1 : 0;
+            rank += (v.w > sel || (v.w == sel && j + 3 < e)) ? 1 : 0;
+        }
+        if (rank < n_expert_used) {
+            ids[(int64_t) n_experts * row + rank] = e;
+            s_w[wy][rank] = wt;
+        }
+    }
+    __syncthreads();
+
+    if (active && e < 32) {
+        float v   = 0.0f;
+        float sum = 0.0f;
+        if (e < n_expert_used) {
+            v = s_w[wy][e] * scale_val;
+            weights[(int64_t) n_expert_used * row + e] = v;
+            sum += v;
+        }
+        if (config.norm_dst) {
+            sum = warp_reduce_sum(sum);
+            const float f = config.norm_scale/(sum + config.norm_eps);
+            if (e < n_expert_used) {
+                config.norm_dst[(int64_t) row*n_expert_used + e] = v*f;
+            }
+        }
+    }
 }
 
 template<bool has_bias>
@@ -441,7 +539,10 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args) {
+                           const ggml_cuda_topk_moe_args & args,
+                           ggml_tensor *                   norm_dst,
+                           float                           norm_eps,
+                           float                           norm_scale) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
@@ -474,6 +575,24 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.delayed_softmax   = args.delayed_softmax;
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
+    config.norm_dst          = norm_dst ? (float *) norm_dst->data : nullptr;
+    config.norm_eps          = norm_eps;
+    config.norm_scale        = norm_scale;
+    GGML_ASSERT(!norm_dst || (norm_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(norm_dst) && ggml_nelements(norm_dst) == ggml_nelements(weights) &&
+                              n_expert_used <= ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size && !with_norm));
+
+    // local: with the normalisation epilogue (the Inkling 2 router), 128 experts and sigmoid scores with a bias, the rank kernel
+    // (same ids and weights). GGML_CUDA_INK2_TOPK_RANK=0 keeps the rounds of argmax.
+    static const bool rank_ok = []() { const char * e = getenv("GGML_CUDA_INK2_TOPK_RANK"); return !(e && e[0] == '0'); }();
+    if (rank_ok && norm_dst && bias && args.sigmoid && !args.sqrt_softplus && !args.delayed_softmax && !with_norm && args.n_groups == 0 &&
+            n_experts == 128 && n_expert_used <= 32 && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32) {
+        const dim3 grid_dims((n_rows + TOPK_MOE_ROWS_PER_BLOCK - 1) / TOPK_MOE_ROWS_PER_BLOCK, 1, 1);
+        const dim3 block_dims(128, TOPK_MOE_ROWS_PER_BLOCK, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+        ggml_cuda_kernel_launch(ink2_topk_rank_cuda<128>, launch_params, logits_d, weights_d, ids_d, (const float *) bias_d, n_rows,
+            n_expert_used, scale_val, config);
+        return;
+    }
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,

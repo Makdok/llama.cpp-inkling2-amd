@@ -25,7 +25,10 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args);
+                           const ggml_cuda_topk_moe_args & args,
+                           ggml_tensor *                   norm_dst   = nullptr,
+                           float                           norm_eps   = 0.0f,
+                           float                           norm_scale = 1.0f);
 
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,
