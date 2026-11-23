@@ -5,6 +5,8 @@
 #include "log.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 
 //
 // server_prompt
@@ -407,6 +409,16 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
             // if we are about to lose a large portion of the existing context - save it in the prompt cache
             if (f_keep < 0.5f) {
+                update_cache = true;
+            }
+
+            // local: or a long tail in absolute terms. Conversations that share a long system prompt keep more than half of
+            // each other's tokens, so without this the tail of the slot is neither saved nor looked up in the prompt cache when
+            // they take turns, and each switch re-reads it. INKLING2_CACHE_TAIL = minimum number of tokens the slot would lose
+            // (0 = off, the default: a client that drops the reasoning of the previous turn would pay a save at every turn).
+            static const int64_t cache_tail = []() { const char * e = getenv("INKLING2_CACHE_TAIL"); return e ? (int64_t) atoll(e) : 0; }();
+            const int64_t n_lost = (int64_t) ret->prompt->tokens.size() - (int64_t) llroundf(f_sim_best*task.tokens.size());
+            if (cache_tail > 0 && n_lost >= cache_tail) {
                 update_cache = true;
             }
         }
