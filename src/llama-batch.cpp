@@ -662,7 +662,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t max_multi) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -718,6 +718,29 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     for (uint32_t s = 0; s < n_seqs; ++s) {
         while (used[seq_set_map[cur_seq_set[s]][cur_idx[s]]]) {
             ++cur_idx[s];
+        }
+    }
+
+    // local: several sequence sets only when each has at most max_multi tokens left: the first run of such sets (consecutive in
+    // the set order, so that sequential ids stay sequential), or else the first set alone
+    if (max_multi > 0 && n_seqs > 1) {
+        const auto n_left = [&](uint32_t s) { return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]); };
+        uint32_t s0 = 0;
+        while (s0 < n_seqs && n_left(s0) > max_multi) {
+            ++s0;
+        }
+        uint32_t s1 = s0;
+        while (s1 < n_seqs && n_left(s1) <= max_multi) {
+            ++s1;
+        }
+        if (s0 == n_seqs) {
+            s0 = 0;
+            s1 = 1;
+        }
+        if (s0 > 0 || s1 < n_seqs) {
+            cur_seq_set = std::vector<seq_set_t>(cur_seq_set.begin() + s0, cur_seq_set.begin() + s1);
+            cur_idx     = std::vector<int32_t>(cur_idx.begin() + s0, cur_idx.begin() + s1);
+            n_seqs      = s1 - s0;
         }
     }
 

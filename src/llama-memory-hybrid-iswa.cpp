@@ -62,7 +62,12 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    )) {
+    // local (Inkling 2): see llama_inkling2_multi_seq_tokens
+    if (model.arch == LLM_ARCH_INKLING2) {
+        split_max_multi = llama_inkling2_multi_seq_tokens();
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -86,7 +91,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // local: with separate streams, a ubatch of several sequences only for short steps, so that prompts keep the
+                // one-stream (far) attention path and the reserved compute buffer covers every ubatch
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, unified ? 0 : split_max_multi);
             }
 
             if (ubatch.n_tokens == 0) {

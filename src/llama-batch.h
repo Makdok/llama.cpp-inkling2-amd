@@ -178,6 +178,9 @@ public:
     uint32_t get_n_outputs() const;
     uint32_t get_n_used()    const;
 
+    // local: every sequence set of the batch has exactly one token (and there are several)
+    bool one_token_per_seq_set() const { return batch.n_tokens > 1 && seq_set_map.size() == (size_t) batch.n_tokens; }
+
     // the array of output indices in the order they were encountered during the ubatch splitting
     std::vector<int32_t> & get_out_ids();
 
@@ -194,7 +197,9 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    // local: max_multi > 0 = a ubatch holds several sequence sets only when each has at most max_multi tokens left (decode and
+    //   verify steps); a longer one (a prompt) goes alone, after the run of short ones
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t max_multi = 0);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     // TODO: extend to support multiple _full_ sequences in the ubatch

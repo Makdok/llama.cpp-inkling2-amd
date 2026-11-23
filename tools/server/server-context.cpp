@@ -3808,6 +3808,26 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // local: with several slots generating at once, one verify batch holds n_slots x (1 + n_draft) tokens and pays the
+        // expert weights and the attention of all of them. INKLING2_SPEC_MULTI_NMAX=k[,n] caps the draft of each slot at k
+        // tokens while at least n slots (at least 2) generate; fewer slots draft as usual. Default 0,3: no drafts while 3 or
+        // more slots generate (measured: 4 slots 122 -> 131 tok/s in all; 2 slots still gain from the drafts). -1: no cap.
+        static const std::pair<int, int> spec_multi = []() {
+            const char * e = getenv("INKLING2_SPEC_MULTI_NMAX");
+            if (!e) {
+                return std::make_pair(0, 3);
+            }
+            const char * c = strchr(e, ',');
+            return std::make_pair(atoi(e), c ? std::max(2, atoi(c + 1)) : 2);
+        }();
+        const int spec_multi_nmax = spec_multi.first;
+        int n_slots_generating = 0;
+        if (spec && spec_multi_nmax >= 0) {
+            for (const auto & s : slots) {
+                n_slots_generating += s.state == SLOT_STATE_GENERATING;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -3833,7 +3853,11 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = slot.get_n_draft_max();
+                if (spec_multi_nmax >= 0 && n_slots_generating >= spec_multi.second && slot.spec_draft.empty()) {
+                    // (a draft kept for a replay is left as it is)
+                    n_draft_max = std::min(n_draft_max, spec_multi_nmax);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());

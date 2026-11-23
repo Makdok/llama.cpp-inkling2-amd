@@ -88,6 +88,9 @@ private:
 
     const std::unique_ptr<llama_kv_cache_iswa> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    // local: with separate streams, ubatches of several sequences only for short steps (see init_batch); 0 = off
+    uint32_t split_max_multi = 0;
 };
 
 class llama_memory_hybrid_iswa_context : public llama_memory_context_i {
