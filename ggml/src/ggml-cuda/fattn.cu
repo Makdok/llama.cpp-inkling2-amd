@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "inkling2-fused.cuh" // ggml_cuda_ink2_arch_ok
 
 #if !defined(GGML_USE_MUSA)
 
@@ -216,7 +217,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
     // a mask with a head dimension is not shared by the Q heads of a K/V head
-    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    // (local: the far mode with an implicit causal mask has no mask tensor, it is shared by construction)
+    const bool far_causal = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED && ((const float *) dst->op_params)[6] != 0.0f && !mask;
+    bool use_gqa_opt = (far_causal || (mask && mask->ne[2] == 1)) && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -259,6 +262,24 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On RDNA it is preferable to minimize wasted compute vs. duplicate I/O for the mask.
     if (amd_wmma_available(cc)) {
+#if defined(GGML_USE_HIP)
+        // local (RDNA3): GQA ratio 3 as 3 heads per tile instead of 4 with a padding column (a quarter less work).
+        // GGML_CUDA_INK2_FA_GQA3 = 0 off, 16 or 32 = queries per tile (wider tiles need batches of more than 32 tokens).
+        if constexpr (DKQ == 128 && DV == 128) {
+            static const int gqa3 = [] {
+                const char * e = getenv("GGML_CUDA_INK2_FA_GQA3");
+                return e ? atoi(e) : 16;
+            }();
+            if (use_gqa_opt && gqa_ratio == 3 && gqa3 > 0 && Q->ne[1] > 16 && ggml_cuda_ink2_arch_ok(ggml_cuda_get_device())) {
+                if (gqa3 >= 32 && Q->ne[1] > 32) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, 3>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16, 3>(ctx, dst);
+                }
+                return;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
@@ -451,10 +472,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// local: q8_0 K with q4_0 V at head size 128 (a 4-bit V for very long contexts with the K precision of q8_0) is compiled
+// here when the build does not list it in GGML_CUDA_FA_QUANTS: without it a decoded row would copy the whole K/V view to F16
+#if !GGML_CUDA_FA_Q8_0_Q4_0
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+#endif // !GGML_CUDA_FA_Q8_0_Q4_0
+
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K_in, const ggml_type type_V_in) {
     const ggml_type type_K = type_K_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K_in;
     const ggml_type type_V = type_V_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V_in;
+#if !GGML_CUDA_FA_Q8_0_Q4_0
+    if (head_size == 128 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q4_0) {
+        return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>;
+    }
+#endif // !GGML_CUDA_FA_Q8_0_Q4_0
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q4_1, F16)
@@ -607,6 +639,33 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
 
     if ((Q->ne[0] != 64 && Q->ne[0] != 128) || V->ne[0] != Q->ne[0]) {
         return false;
+    }
+
+    // local (RDNA3): the far mode (rel carries the far bias and the folded sink) runs on the WMMA kernel; the mask must be
+    // shared by the heads and K/V padded, as for the GQA optimization, and the batch large enough for the wide tiles. Only
+    // run on RDNA3 (ggml_cuda_ink2_arch_ok): other GPUs report the far mode unsupported and the model takes its stock path.
+    if (((const float *) dst->op_params)[6] != 0.0f) {
+        const ggml_tensor * mask = dst->src[3];
+        // local: no mask = implicit causal mask (position-contiguous cache), not for a rotated ring
+        const bool mask_ok = mask ? mask->ne[2] == 1 : ggml_flash_attn_ext_banded_get_far_rot(dst) == 0;
+        if (!(amd_wmma_available(ggml_cuda_info().devices[device].cc) && ggml_cuda_ink2_arch_ok(device) && mask_ok &&
+                K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= 1 && Q->ne[2] / K->ne[2] > 1)) {
+            return false;
+        }
+        // same alignment rule as the GQA optimization: without it the dispatch would pick ncols2 = 1,
+        // a variant that is not compiled for WMMA (local: a q8_0 K/V is read through a contiguous F16 copy made at launch,
+        // see launch_fattn, so its own strides do not matter)
+        for (const ggml_tensor * t : {Q, K, V, mask}) {
+            if (!t || ((t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0) && (t == K || t == V))) {
+                continue;
+            }
+            for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+                if (t->nb[i] % 16 != 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     return turing_mma_available(ggml_cuda_info().devices[device].cc);
@@ -800,9 +859,39 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+    // local (RDNA3): a mask with a head dimension (Inkling 2 relative bias) disables the GQA optimization, which sent prefill
+    // to the tile kernel. GGML_HIP_FATTN_WMMA_HEADMASK=N lets WMMA take it from N query rows up (0/unset = off); experimental
+    // (can hang the GPU), only in builds with GGML_CUDA_INK2_COST_TOOLS.
+#if defined(GGML_CUDA_INK2_COST_TOOLS)
+    static const int wmma_headmask_min_q = []() {
+        const char * e = getenv("GGML_HIP_FATTN_WMMA_HEADMASK");
+        return e ? atoi(e) : 0;
+    }();
+#else
+    static const int wmma_headmask_min_q = 0;
+#endif
+    const bool wmma_headmask = wmma_headmask_min_q > 0 && mask && mask->ne[2] != 1 && max_bias == 0.0f &&
+        n_kv % FATTN_KQ_STRIDE == 0 && Q->ne[1] >= wmma_headmask_min_q;
+    if ((amd_wmma_available(cc) && (gqa_opt_applies || wmma_headmask) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // local (RDNA3 only, ggml_cuda_ink2_arch_ok): a single query row with a per-head mask (Inkling 2 decode) goes to the tile
+    // kernel, faster than the vector kernel at long context (test-backend-ops perf, 24/8 heads, 51200 keys: 245 us instead of
+    // 312; server decode after 51k: 15.4 -> 14.9 ms per token). GGML_CUDA_INK2_FA_TILE1=0 restores the vector kernel.
+    // local (RDNA3): a quantized cache (q8_0 for long contexts) is read in place by the vector kernel up to 8 query rows (one
+    // token and the verify batches of speculative decoding); the tile kernel would first copy the whole K/V view to F16 at
+    // every call. GGML_CUDA_INK2_FA_QVEC=0 restores the stock choice.
+    static const bool ink2_fa_qvec = []() { const char * e = getenv("GGML_CUDA_INK2_FA_QVEC"); return !(e && e[0] == '0'); }();
+    const bool kv_quantized = ggml_is_quantized(K->type) || ggml_is_quantized(V->type);
+    if (ink2_fa_qvec && kv_quantized && ggml_cuda_ink2_arch_ok(device) && can_use_vector_kernel && Q->ne[1] <= 8 &&
+            ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+    static const bool ink2_fa_tile1 = []() { const char * e = getenv("GGML_CUDA_INK2_FA_TILE1"); return !(e && e[0] == '0'); }();
+    if (ink2_fa_tile1 && ggml_cuda_ink2_arch_ok(device) && mask && mask->ne[2] != 1 && Q->ne[1] == 1 && !kv_quantized) {
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // If there are no tensor cores available, use the generic tile kernel:
@@ -858,6 +947,373 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// local (RDNA3): two to eight query rows (the verify batch of speculative decoding) over a q8_0 cache, D 128, G query heads per
+// K/V head. The vector kernel runs one block per query head and pair of rows, so every K/V row is loaded and dequantized 2 G
+// times and the kernel ends up far from the memory bound (126k keys, 4 rows, 24/8 heads: ~1 ms per call for 274 MB; this
+// kernel ~0.5 ms). One decoded row stays on the vector kernel (this kernel is faster per call, 438 vs 519 us at 126k keys,
+// but no gain was measurable per token at 51k).
+// Here one block takes the T rows of the G heads of one K/V head (T G columns) over a slice of the keys (split-K, combined
+// by flash_attn_combine_results like the vector kernel): each lane scores one key for all columns (int8 dot products with
+// Q quantized to q8_1 once per block, as in the vector kernel), then the warp accumulates P V with a lane per 4 dimensions
+// (FP16 products of two keys at a time, F32 sums). Each warp keeps its own softmax state; the warps of a block are merged at
+// the end. Per-head or shared masks. GGML_CUDA_INK2_FA_Q8GQA=0 keeps the vector kernel.
+#define INK2_FQ_D   128
+#define INK2_FQ_NW  4   // warps per block
+#define INK2_FQ_C   32  // keys per warp and step (one per lane)
+
+#if defined(RDNA3)
+typedef _Float16 ink2_fq_h2 __attribute__((ext_vector_type(2)));
+
+static __device__ __forceinline__ uint32_t ink2_fq_u32_at(const uint32_t * w, const int off) {
+    // off is a compile-time constant after unrolling: aligned word or two words joined at a 2-byte offset
+    return (off % 4 == 0) ? w[off/4] : __builtin_amdgcn_alignbyte(w[off/4 + 1], w[off/4], off % 4);
+}
+#endif // defined(RDNA3)
+
+// V4: q4_0 V instead of q8_0 (K stays q8_0): the lane's 4 values of a key are the low (values 0-15 of the block) or high
+// (16-31) nibbles of 4 bytes, turned into FP16 the same way (1024 + n, exact) before the scale
+template <int T, int G, bool MS, bool V4>
+static __global__ void __launch_bounds__(INK2_FQ_NW*WARP_SIZE, 2) ink2_fattn_q8_gqa(
+        const char * __restrict__ Q_ptr, const char * __restrict__ K_ptr, const char * __restrict__ V_ptr,
+        const char * __restrict__ mask_ptr, const char * __restrict__ sinks_ptr, const int * __restrict__ KV_max_ptr,
+        const int * __restrict__ KV_rows_ptr, float * __restrict__ dst, float2 * __restrict__ dst_meta,
+        const float scale, const float max_bias, const float m0, const float m1, const uint32_t n_head_log2, const float logit_softcap,
+        const int32_t ne00, const uint3 ne01, const int32_t ne02, const int32_t ne03,
+                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
+                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+        const int32_t ne31, const int32_t ne32, const int32_t ne33,
+        const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+#if defined(RDNA3)
+    constexpr int D = INK2_FQ_D, NW = INK2_FQ_NW, C = INK2_FQ_C, NC = T*G;
+    GGML_UNUSED_VARS(KV_max_ptr, KV_rows_ptr, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne13, ne31);
+
+    __shared__ __align__(16) int   q_qs[NC][D/4];       // Q*scale as int8, 4 per int
+    __shared__ __align__(16) float q_d[NC][D/32];       // q8_1 block scales
+    __shared__ __align__(16) half  p_h[NW][C/2][NC][2]; // probabilities of a step, per warp: [key pair][column][key of the pair]
+    __shared__ __align__(16) float o_s[NW*D];           // merge of the warps, one column at a time
+    __shared__ float m_s[NW][NC], l_s[NW][NC];
+
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int n_q  = int(ne01.z);
+    const int ic0  = blockIdx.x*T;
+    const int seq  = blockIdx.z / ne12;
+    const int kvh  = blockIdx.z - seq*ne12;
+
+    // column c = (row c % T, head kvh G + c / T)
+    for (int c = warp; c < NC; c += NW) {
+        const int t = c % T, h = kvh*G + c / T;
+        float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (ic0 + t < n_q) {
+            x = *(const float4 *) (Q_ptr + seq*nb03 + h*nb02 + (ic0 + t)*nb01 + 16*lane);
+        }
+        x.x *= scale; x.y *= scale; x.z *= scale; x.w *= scale;
+        float amax = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w)));
+#pragma unroll
+        for (int o = 1; o < 8; o <<= 1) {
+            amax = fmaxf(amax, __shfl_xor(amax, o, WARP_SIZE));
+        }
+        const float d  = amax/127.0f;
+        const float id = d > 0.0f ? 1.0f/d : 0.0f;
+        const int q0 = __float2int_rn(x.x*id), q1 = __float2int_rn(x.y*id), q2 = __float2int_rn(x.z*id), q3 = __float2int_rn(x.w*id);
+        q_qs[c][lane] = (q0 & 0xFF) | ((q1 & 0xFF) << 8) | ((q2 & 0xFF) << 16) | (int(uint32_t(q3) << 24));
+        if (lane % 8 == 0) {
+            q_d[c][lane/8] = d;
+        }
+    }
+    __syncthreads();
+
+    float m[NC], l[NC], o[NC][4];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        m[c] = -FLT_MAX/2.0f;
+        l[c] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            o[c][e] = 0.0f;
+        }
+    }
+
+    const char * Kh = K_ptr + seq*nb13 + kvh*nb12;
+    const char * Vh = V_ptr + seq*nb23 + kvh*nb22;
+    // MS: several streams, one mask per stream (or one for all)
+    const char * Mh = mask_ptr ? mask_ptr + (MS && ne33 > 1 ? seq*nb33 : 0) : nullptr;
+    const int vb = lane/8, vj = lane%8; // V: the lane's 4 dimensions are values 4 vj .. 4 vj + 3 of block vb
+
+    for (int k0 = (blockIdx.y*NW + warp)*C; k0 < ne11; k0 += gridDim.y*NW*C) {
+        const int key = k0 + lane;
+        float s[NC];
+        if (key < ne11) {
+            // the 136-byte row of 4 q8_0 blocks (8-byte aligned)
+            uint32_t w[34];
+            const uint2 * kr = (const uint2 *) (Kh + (int64_t) key*nb11);
+#pragma unroll
+            for (int i = 0; i < 17; ++i) {
+                const uint2 u = kr[i];
+                w[2*i + 0] = u.x;
+                w[2*i + 1] = u.y;
+            }
+            float dk[4];
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const uint32_t bits = ((34*b) % 4 == 0) ? (w[(34*b)/4] & 0xFFFF) : (w[(34*b)/4] >> 16);
+                half hd;
+                const uint16_t b16 = (uint16_t) bits;
+                memcpy(&hd, &b16, sizeof(hd));
+                dk[b] = __half2float(hd);
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    const int4 qa = *(const int4 *) &q_qs[c][8*b + 0];
+                    const int4 qb = *(const int4 *) &q_qs[c][8*b + 4];
+                    int isum = 0;
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 +  0), qa.x, isum);
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 +  4), qa.y, isum);
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 +  8), qa.z, isum);
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 + 12), qa.w, isum);
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 + 16), qb.x, isum);
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 + 20), qb.y, isum);
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 + 24), qb.z, isum);
+                    isum = ggml_cuda_dp4a((int) ink2_fq_u32_at(w, 34*b + 2 + 28), qb.w, isum);
+                    acc += dk[b]*q_d[c][b]*(float) isum;
+                }
+                const int t = c % T, h = kvh*G + c / T;
+                if (ic0 + t >= n_q) {
+                    acc = -INFINITY;
+                } else if (Mh) {
+                    acc += __half2float(*(const half *) (Mh + (h % ne32)*nb32 + (int64_t) (ic0 + t)*nb31 + (int64_t) key*sizeof(half)));
+                }
+                s[c] = acc;
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                s[c] = -INFINITY;
+            }
+        }
+
+        // online softmax per column over the warp's keys; the lane keeps a partial row sum (reduced at the end)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float m_new = fmaxf(m[c], warp_reduce_max(s[c]));
+            const float f     = expf(m[c] - m_new);
+            const float p     = expf(s[c] - m_new);
+            m[c] = m_new;
+            l[c] = l[c]*f + p;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                o[c][e] *= f;
+            }
+            p_h[warp][lane/2][c][lane%2] = __float2half(p);
+        }
+        ggml_cuda_syncwarp();
+
+        // P V: the lane adds its 4 dimensions of the warp's keys, two keys per dot product (FP16 products as in the other
+        // attention kernels, F32 sums): V of a key pair as half2 (v of key 2 kp, v of key 2 kp + 1) per dimension
+#pragma unroll 4
+        for (int kp = 0; kp < C/2; ++kp) {
+            const int ka = k0 + 2*kp;
+            if (ka >= ne11) {
+                break;
+            }
+            ink2_fq_h2 v2[4];
+            if constexpr (!V4) {
+            const char * va = Vh + (int64_t) ka*nb21 + 34*vb;
+            const char * vb2 = ka + 1 < ne11 ? va + nb21 : va; // past the end: any row, its probability is 0
+            const uint32_t dd = uint32_t(*(const uint16_t *) va) | (uint32_t(*(const uint16_t *) vb2) << 16);
+            const uint32_t qa = (uint32_t(*(const uint16_t *) (va  + 2 + 4*vj)) | (uint32_t(*(const uint16_t *) (va  + 4 + 4*vj)) << 16)) ^ 0x80808080u;
+            const uint32_t qb = (uint32_t(*(const uint16_t *) (vb2 + 2 + 4*vj)) | (uint32_t(*(const uint16_t *) (vb2 + 4 + 4*vj)) << 16)) ^ 0x80808080u;
+            ink2_fq_h2 d2;
+            memcpy(&d2, &dd, sizeof(d2));
+            const ink2_fq_h2 off2 = { (_Float16) 1152.0f, (_Float16) 1152.0f };
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                // bytes e of the two keys as 0x64xx: 1024 + (q + 128) in FP16, exact
+                const uint32_t ab = __builtin_amdgcn_perm(qb, qa, uint32_t(e) | (uint32_t(4 + e) << 8));
+                const uint32_t h  = __builtin_amdgcn_perm(0x64646464u, ab, 0x04010400u);
+                ink2_fq_h2 x;
+                memcpy(&x, &h, sizeof(x));
+                v2[e] = (x - off2)*d2;
+            }
+            } else {
+            // q4_0 block of 18 bytes: scale, then 16 bytes holding values j (low nibble) and j + 16 (high nibble)
+            const char * va = Vh + (int64_t) ka*nb21 + 18*vb;
+            const char * vb2 = ka + 1 < ne11 ? va + nb21 : va; // past the end: any row, its probability is 0
+            const uint32_t dd = uint32_t(*(const uint16_t *) va) | (uint32_t(*(const uint16_t *) vb2) << 16);
+            const int qo = 2 + 4*(vj & 3);
+            const int sh = vj >= 4 ? 4 : 0;
+            const uint32_t qa = ((uint32_t(*(const uint16_t *) (va  + qo)) | (uint32_t(*(const uint16_t *) (va  + qo + 2)) << 16)) >> sh) & 0x0F0F0F0Fu;
+            const uint32_t qb = ((uint32_t(*(const uint16_t *) (vb2 + qo)) | (uint32_t(*(const uint16_t *) (vb2 + qo + 2)) << 16)) >> sh) & 0x0F0F0F0Fu;
+            ink2_fq_h2 d2;
+            memcpy(&d2, &dd, sizeof(d2));
+            const ink2_fq_h2 off2 = { (_Float16) 1032.0f, (_Float16) 1032.0f };
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                // nibbles e of the two keys as 0x64xx: 1024 + n in FP16, exact; n - 8 is the q4_0 value
+                const uint32_t ab = __builtin_amdgcn_perm(qb, qa, uint32_t(e) | (uint32_t(4 + e) << 8));
+                const uint32_t h  = __builtin_amdgcn_perm(0x64646464u, ab, 0x04010400u);
+                ink2_fq_h2 x;
+                memcpy(&x, &h, sizeof(x));
+                v2[e] = (x - off2)*d2;
+            }
+            }
+            ink2_fq_h2 p2[NC];
+#pragma unroll
+            for (int c4 = 0; c4 < NC; c4 += 4) {
+                if (c4 + 4 <= NC) {
+                    const uint4 u = *(const uint4 *) &p_h[warp][kp][c4][0];
+                    memcpy(&p2[c4 + 0], &u.x, 4);
+                    memcpy(&p2[c4 + 1], &u.y, 4);
+                    memcpy(&p2[c4 + 2], &u.z, 4);
+                    memcpy(&p2[c4 + 3], &u.w, 4);
+                } else {
+#pragma unroll
+                    for (int cc = 0; c4 + cc < NC; ++cc) {
+                        memcpy(&p2[c4 + cc], &p_h[warp][kp][c4 + cc][0], 4);
+                    }
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    o[c][e] = __builtin_amdgcn_fdot2(p2[c], v2[e], o[c][e], false);
+                }
+            }
+        }
+        ggml_cuda_syncwarp();
+    }
+
+    // row sums of the warp; the sink (one warp of the first key slice)
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        l[c] = warp_reduce_sum(l[c]);
+    }
+    if (sinks_ptr && blockIdx.y == 0 && warp == 0) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float sink  = ((const float *) sinks_ptr)[kvh*G + c / T];
+            const float m_new = fmaxf(m[c], sink);
+            const float f     = expf(m[c] - m_new);
+            l[c] = l[c]*f + expf(sink - m_new);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                o[c][e] *= f;
+            }
+            m[c] = m_new;
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            m_s[warp][c] = m[c];
+            l_s[warp][c] = l[c];
+        }
+    }
+    __syncthreads();
+
+    // merge the warps: column by column, every warp scales its part, the block sums them
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float mb = m_s[0][c];
+#pragma unroll
+        for (int w2 = 1; w2 < NW; ++w2) {
+            mb = fmaxf(mb, m_s[w2][c]);
+        }
+        float lb = 0.0f;
+#pragma unroll
+        for (int w2 = 0; w2 < NW; ++w2) {
+            lb += l_s[w2][c]*expf(m_s[w2][c] - mb);
+        }
+        const float f = expf(m[c] - mb);
+        *(float4 *) &o_s[warp*D + 4*lane] = make_float4(o[c][0]*f, o[c][1]*f, o[c][2]*f, o[c][3]*f);
+        __syncthreads();
+        const int t = c % T, h = kvh*G + c / T;
+        if (ic0 + t < n_q) {
+            const int i = warp*WARP_SIZE + lane; // dimension
+            float r = 0.0f;
+#pragma unroll
+            for (int w2 = 0; w2 < NW; ++w2) {
+                r += o_s[w2*D + i];
+            }
+            const int64_t j = ((int64_t) (seq*n_q + ic0 + t)*ne02 + h)*gridDim.y + blockIdx.y;
+            dst[j*D + i] = gridDim.y == 1 ? r/lb : r;
+            if (gridDim.y > 1 && i == 0) {
+                dst_meta[j] = make_float2(mb, lb);
+            }
+        }
+        __syncthreads();
+    }
+#else
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst, dst_meta, scale, max_bias, m0, m1,
+        n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
+        nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33);
+    NO_DEVICE_CODE;
+#endif // defined(RDNA3)
+}
+
+// whether the kernel above takes this op; GGML_CUDA_INK2_FA_Q8GQA=0 leaves it to the vector kernel
+static bool ggml_cuda_ink2_fattn_q8_gqa_ok(const int device, const ggml_tensor * dst) {
+    static const bool enabled = []() { const char * e = getenv("GGML_CUDA_INK2_FA_Q8GQA"); return !(e && e[0] == '0'); }();
+    const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3], * sinks = dst->src[4];
+    if (!enabled || dst->op != GGML_OP_FLASH_ATTN_EXT || dst->src[5] || !ggml_cuda_ink2_arch_ok(device)) {
+        return false;
+    }
+    float max_bias, logit_softcap;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const auto al8 = [](size_t x) { return x % 8 == 0; };
+    // several streams (slots of a server decoding at once): one or more rows per stream, each stream with its own K/V and mask
+    // (one decoded row per stream included: the vector kernel there runs one block per query head and stream).
+    // GGML_CUDA_INK2_FA_Q8GQA_MS=0 keeps them on the vector kernel.
+    static const bool ms_enabled = []() { const char * e = getenv("GGML_CUDA_INK2_FA_Q8GQA_MS"); return !(e && e[0] == '0'); }();
+    const int64_t n_stream = Q->ne[3];
+    const bool    rows_ok  = n_stream == 1 ? Q->ne[1] >= 2 && Q->ne[1] <= 8 : ms_enabled && Q->ne[1] >= 1 && Q->ne[1] <= 8;
+    // a q4_0 V (K q8_0) is read by the V4 variant; GGML_CUDA_INK2_FA_Q8GQA_V4=0 leaves it to the vector kernel
+    static const bool v4_enabled = []() { const char * e = getenv("GGML_CUDA_INK2_FA_Q8GQA_V4"); return !(e && e[0] == '0'); }();
+    const bool v_ok = V->type == GGML_TYPE_Q8_0 || (v4_enabled && V->type == GGML_TYPE_Q4_0);
+    return K->type == GGML_TYPE_Q8_0 && v_ok && Q->type == GGML_TYPE_F32 &&
+        Q->ne[0] == INK2_FQ_D && K->ne[0] == INK2_FQ_D && V->ne[0] == INK2_FQ_D && K->ne[2] == V->ne[2] &&
+        K->ne[2] > 0 && Q->ne[2] == 3*K->ne[2] && rows_ok && n_stream >= 1 && K->ne[3] == n_stream && V->ne[3] == n_stream &&
+        max_bias == 0.0f && logit_softcap == 0.0f && Q->nb[0] == sizeof(float) && Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 &&
+        Q->nb[3] % 16 == 0 && (uintptr_t) Q->data % 16 == 0 && al8((uintptr_t) K->data) && al8(K->nb[1]) && al8(K->nb[2]) && al8(K->nb[3]) &&
+        (uintptr_t) V->data % 2 == 0 && V->nb[1] % 2 == 0 && V->nb[2] % 2 == 0 && V->nb[3] % 2 == 0 && K->ne[1] < INT_MAX &&
+        (!mask || (mask->type == GGML_TYPE_F16 && (mask->ne[3] == 1 || mask->ne[3] == n_stream) && (mask->ne[2] == 1 || mask->ne[2] == Q->ne[2]) &&
+                   mask->ne[0] >= K->ne[1] && mask->ne[1] >= Q->ne[1])) &&
+        (!sinks || (sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks)));
+}
+
+template <bool V4>
+static void ggml_cuda_ink2_fattn_q8_gqa_v(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    // one row is taken only with several streams (see ggml_cuda_ink2_fattn_q8_gqa_ok)
+    if (Q->ne[3] > 1) {
+        if (Q->ne[1] == 1) {
+            launch_fattn<INK2_FQ_D, 1, 3>(ctx, dst, ink2_fattn_q8_gqa<1, 3, true, V4>, INK2_FQ_NW, 0, INK2_FQ_NW*INK2_FQ_C, false, false, false, false);
+        } else if (Q->ne[1] <= 4) {
+            launch_fattn<INK2_FQ_D, 4, 3>(ctx, dst, ink2_fattn_q8_gqa<4, 3, true, V4>, INK2_FQ_NW, 0, INK2_FQ_NW*INK2_FQ_C, false, false, false, false);
+        } else {
+            launch_fattn<INK2_FQ_D, 8, 3>(ctx, dst, ink2_fattn_q8_gqa<8, 3, true, V4>, INK2_FQ_NW, 0, INK2_FQ_NW*INK2_FQ_C, false, false, false, false);
+        }
+    } else if (Q->ne[1] <= 4) {
+        launch_fattn<INK2_FQ_D, 4, 3>(ctx, dst, ink2_fattn_q8_gqa<4, 3, false, V4>, INK2_FQ_NW, 0, INK2_FQ_NW*INK2_FQ_C, false, false, false, false);
+    } else {
+        launch_fattn<INK2_FQ_D, 8, 3>(ctx, dst, ink2_fattn_q8_gqa<8, 3, false, V4>, INK2_FQ_NW, 0, INK2_FQ_NW*INK2_FQ_C, false, false, false, false);
+    }
+}
+
+static void ggml_cuda_ink2_fattn_q8_gqa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->src[2]->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_ink2_fattn_q8_gqa_v<true>(ctx, dst);
+    } else {
+        ggml_cuda_ink2_fattn_q8_gqa_v<false>(ctx, dst);
+    }
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
@@ -867,6 +1323,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+            if (ggml_cuda_ink2_fattn_q8_gqa_ok(ggml_cuda_get_device(), dst)) {
+                ggml_cuda_ink2_fattn_q8_gqa(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:

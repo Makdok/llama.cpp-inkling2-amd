@@ -839,8 +839,8 @@ static bool fattn_banded_type_supported(ggml_type type) {
 }
 
 bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * dst) {
-    GGML_UNUSED(device);
 #if defined(GGML_USE_MUSA)
+    GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
 #else
@@ -856,8 +856,12 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!fattn_banded_type_supported(k->type) ||
-        !fattn_banded_type_supported(v->type) ||
+    // local: the far mode also takes a q8_0 K/V (the WMMA launch reads it through an F16 copy, see launch_fattn), and a
+    // q8_0 K with a q4_0 V (the same copy)
+    const bool far_q8 = ((const float *) dst->op_params)[6] != 0.0f && k->type == GGML_TYPE_Q8_0 &&
+        (v->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q4_0);
+    if ((!fattn_banded_type_supported(k->type) && !far_q8) ||
+        (!fattn_banded_type_supported(v->type) && !far_q8) ||
         !fattn_banded_type_supported(rel->type)) {
         return false;
     }
@@ -880,6 +884,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     }
     const ggml_tensor * sinks = dst->src[4];
     if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->nb[0] != sizeof(float))) {
+        return false;
+    }
+    // far mode: only the MMA/WMMA kernel implements it
+    if (((const float *) dst->op_params)[6] != 0.0f && !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
         return false;
     }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&

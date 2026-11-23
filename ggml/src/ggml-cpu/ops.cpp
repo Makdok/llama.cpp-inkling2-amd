@@ -9051,9 +9051,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             if (rel) {
                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                // local: in a rotated ring (far_rot) cell ic holds the logical key (ic - rot) mod nek1
+                const int64_t rot    = ggml_flash_attn_ext_banded_get_far_rot(dst);
+                const int64_t ic_log = ic - rot + (ic < rot ? nek1 : 0);
+                const int64_t rel_dist = iq1 + (nek1 - ggml_flash_attn_ext_banded_get_far_pad(dst) - neq1) - ic_log;
                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
+                } else if (rel_dist >= 0 && ggml_flash_attn_ext_banded_get_far(dst)) {
+                    // far mode: the last row applies to every larger distance
+                    s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel->ne[0] - 1);
                 }
             }
 
@@ -9092,9 +9098,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        // sinks - apply only on the first kv-chunk
-        if (sinks && ic_start == 0) {
-            const float s = *(const float *)((const char *) sinks->data + h*sinks->nb[0] +
+        // sinks - apply only on the first kv-chunk (far mode: a sink of logit 0)
+        const bool far_sink = rel && ggml_flash_attn_ext_banded_get_far(dst);
+        if ((sinks || far_sink) && ic_start == 0) {
+            const float s = !sinks ? 0.0f : *(const float *)((const char *) sinks->data + h*sinks->nb[0] +
                 (sinks->ne[1] > 1 ? iq1*sinks->nb[1] : 0) + (sinks->ne[2] > 1 ? iq3*sinks->nb[2] : 0));
 
             float ms = 1.0f;
